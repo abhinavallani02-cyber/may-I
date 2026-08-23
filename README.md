@@ -23,6 +23,18 @@ name (with glob support) plus an optional path-prefix check on arguments;
 there's no general condition language yet. It has not had a security
 review. Treat it as a working prototype, not a hardened boundary.
 
+**Known limitation: `ask` verdicts require a visible terminal.** The
+approval prompt is written to `/dev/tty`, so it only appears if a human is
+watching the actual terminal running `mayi.mjs`. If an MCP client drives
+may-i through something other than a raw terminal — an editor extension
+like VS Code's Claude Code integration, for instance — the prompt renders
+nowhere in that UI and silently times out to deny after 30 seconds
+(confirmed with a real `write_file` call: denied, no prompt visible
+anywhere). This is a design gap, not a bug — the approval flow assumes CLI
+usage. The right fix is surfacing the prompt through MCP's own
+`elicitation/create` request instead of the tty, so any client can render
+and answer it. Not implemented yet.
+
 ## Install
 
 No install needed to try it — run it directly with `npx`:
