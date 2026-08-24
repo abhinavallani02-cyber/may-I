@@ -8,7 +8,9 @@ between an MCP client (an AI agent) and an MCP server (a set of tools the
 agent can call — read/write files, run queries, send messages, and so on),
 enforcing a policy on every `tools/call` request before it reaches the
 server. For each call it decides `allow`, `deny`, or `ask` — and `ask`
-pauses to prompt a human at the terminal before letting the call through.
+pauses to prompt a human before letting the call through, either through
+the client's own UI (MCP elicitation) or, if the client doesn't support
+that, at the terminal running may-i.
 Everything else (initialization, tool listing, responses, notifications)
 passes through unmodified. The goal is that a human can put real limits on
 what an agent is allowed to do without needing to trust the agent, or the
@@ -23,17 +25,32 @@ name (with glob support) plus an optional path-prefix check on arguments;
 there's no general condition language yet. It has not had a security
 review. Treat it as a working prototype, not a hardened boundary.
 
-**Known limitation: `ask` verdicts require a visible terminal.** The
-approval prompt is written to `/dev/tty`, so it only appears if a human is
-watching the actual terminal running `mayi.mjs`. If an MCP client drives
-may-i through something other than a raw terminal — an editor extension
-like VS Code's Claude Code integration, for instance — the prompt renders
-nowhere in that UI and silently times out to deny after 30 seconds
-(confirmed with a real `write_file` call: denied, no prompt visible
-anywhere). This is a design gap, not a bug — the approval flow assumes CLI
-usage. The right fix is surfacing the prompt through MCP's own
-`elicitation/create` request instead of the tty, so any client can render
-and answer it. Not implemented yet.
+**`ask` verdicts prefer MCP elicitation, with `/dev/tty` as fallback.** If
+the connected client declares the `elicitation` capability at
+`initialize`, may-i sends a real `elicitation/create` request toward it —
+the approval prompt is meant to render in the client's own UI, not a
+terminal. If the client doesn't declare that capability, may-i falls back
+to the original `/dev/tty` prompt, which only appears if a human is
+watching the actual terminal running `mayi.mjs`.
+
+As of this writing, the elicitation path does not actually work end to
+end with Claude Code's VS Code extension — not because of anything on
+may-i's side. Verified with a hand-built test client that properly
+implements the client side of elicitation: may-i's request, response
+handling, and id correlation all work correctly and the call goes
+through. Against the real VS Code extension, the same request is silently
+auto-declined with no UI ever shown, even though the extension correctly
+declares the capability at `initialize`. This is a confirmed, currently
+open upstream bug —
+[anthropics/claude-code#79174](https://github.com/anthropics/claude-code/issues/79174) —
+where interactive VS Code sessions are internally misclassified as
+non-interactive ("print mode") specifically for the elicitation path,
+even though the same session correctly renders other interactive prompts
+(permission dialogs, `AskUserQuestion`). Until that's fixed upstream,
+`ask` verdicts against the VS Code extension will silently deny rather
+than prompt — the correct behavior, since may-i denies on any non-accept
+response rather than failing open, but not a working checkpoint until
+Claude Code fixes its side.
 
 ## Install
 

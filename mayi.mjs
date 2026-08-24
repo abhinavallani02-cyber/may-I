@@ -6,12 +6,19 @@
 //   allow -> forwarded to the server, like any other line
 //   deny  -> never reaches the server; a JSON-RPC error goes back to
 //            the client instead, on the same id
-//   ask   -> a human is prompted on the controlling terminal (/dev/tty,
-//            not stdin -- stdin is the MCP client's channel, not a
-//            human's). y -> forwarded like allow. n or a 30s timeout ->
-//            denied like deny. Other in-flight lines are NOT blocked
-//            while a prompt is pending -- only that one request waits.
-// Everything that isn't a tools/call request is still pure passthrough.
+//   ask   -> a human approves or denies. If the client declared MCP
+//            elicitation support at initialize, the prompt is a real
+//            elicitation/create request sent to the client -- it
+//            renders in the client's own UI, not a terminal. Otherwise
+//            this falls back to /dev/tty (not stdin -- stdin is the
+//            MCP client's channel, not a human's). Either way: approve
+//            -> forwarded like allow. deny/cancel/timeout -> denied
+//            like deny. Other in-flight lines are NOT blocked while a
+//            prompt is pending -- only that one request waits.
+// Everything that isn't a tools/call request is still pure passthrough,
+// with one exception in the client->server direction: replies to
+// elicitation requests may-i itself originated. Those are addressed to
+// may-i, not the server, so they're consumed here and never forwarded.
 
 import { readFileSync, createReadStream, createWriteStream, appendFileSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -175,6 +182,135 @@ function decide(toolName, callArgs) {
 
 const ASK_TIMEOUT_MS = 30000;
 
+// Whether the connected client declared elicitation support, and in which
+// mode(s). Set once, from the client's own `initialize` request as it
+// passes through -- may-i reads this in transit without altering it, so
+// the server still sees the client's real declared capabilities. Starts
+// as "not supported" and stays that way until the client's `initialize`
+// line is actually seen, since nothing should be asked via elicitation
+// before the client has said it can handle one.
+let elicitationSupport = { form: false, url: false };
+
+function inspectInitialize(msg) {
+  const capabilities = msg.params?.capabilities?.elicitation;
+  elicitationSupport = { form: !!capabilities?.form, url: !!capabilities?.url };
+  const supported = elicitationSupport.form || elicitationSupport.url;
+  const modes = [elicitationSupport.form && "form", elicitationSupport.url && "url"].filter(Boolean).join("+");
+  console.error(`[CONFIG] elicitation: ${supported ? `supported (${modes})` : "not supported"}`);
+}
+
+// may-i's own outstanding requests toward the client -- elicitation/create
+// calls it originated itself, as opposed to the client's or server's
+// traffic, which it only ever relays. Kept in a separate map from
+// anything proxied so the two id spaces can never be confused: a
+// tools/call id from the client is never looked up here, and an id in
+// here is never mistaken for one of the client's.
+//
+// Id scheme: every id may-i generates is the string "mayi-elicit-<n>"
+// (a monotonic counter), never a bare number. This is collision-safe
+// because the client and server each generate their own ids
+// independently and may-i never rewrites either -- it only relays them
+// verbatim in both directions. The only way a collision could happen is
+// if the CLIENT itself ever generated the literal string "mayi-elicit-N"
+// as one of its own ids, which no real MCP client does (ids are
+// typically small sequential integers or UUIDs). A numeric id range
+// (e.g. "use ids above 1e9") was considered and rejected: it's not
+// actually safe against a client or server that also picks large
+// numbers, and it silently breaks if a peer ever does. A string prefix
+// no real peer would independently produce is a stronger guarantee than
+// picking a numeric range and hoping nothing else lands in it.
+let elicitCounter = 0;
+const pendingElicitations = new Map(); // id -> { resolve }
+
+function nextElicitId() {
+  elicitCounter += 1;
+  return `mayi-elicit-${elicitCounter}`;
+}
+
+// Sends an elicitation/create request toward the client (on stdout, the
+// same channel the server's real responses travel on -- from the
+// client's perspective, may-i IS the server) and waits for the matching
+// reply. The reply arrives back on process.stdin (client -> may-i), same
+// as any client request, and is intercepted in handleClientLine before
+// it would otherwise be forwarded to the child -- see there. Resolves to
+// "approved", "denied", or "cancelled"; never rejects -- errors and
+// timeouts both resolve to "denied" so a failure here can never fail
+// open into an unapproved tools/call going through.
+function askViaElicitation(name, args) {
+  const id = nextElicitId();
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      pendingElicitations.delete(id);
+      console.error(`[ASK] id=${id} elicitation timed out after ${ASK_TIMEOUT_MS}ms, defaulting to deny`);
+      resolve("denied");
+    }, ASK_TIMEOUT_MS);
+
+    pendingElicitations.set(id, {
+      resolve(outcome) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        pendingElicitations.delete(id);
+        resolve(outcome);
+      },
+    });
+
+    const request = {
+      jsonrpc: "2.0",
+      id,
+      method: "elicitation/create",
+      params: {
+        mode: "form",
+        message: `may-i: approve tool call ${name}(${JSON.stringify(args)})?`,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            approve: {
+              type: "string",
+              enum: ["approve", "deny"],
+              title: "Approve this tool call?",
+            },
+          },
+          required: ["approve"],
+        },
+      },
+    };
+    process.stdout.write(JSON.stringify(request) + "\n");
+  });
+}
+
+// Handles a reply on process.stdin matching one of may-i's own
+// outstanding elicitation ids. Maps the client's response to an outcome:
+//   action "accept" + content.approve === "approve" -> "approved"
+//   action "accept" + content.approve === "deny"     -> "denied"
+//   action "decline"                                 -> "denied"
+//   action "cancel"                                  -> "cancelled"
+//   anything else (malformed, error response, unexpected content) -> "denied"
+// Never resolves to "approved" except on an explicit accept+approve --
+// every other shape of reply denies, so a malformed or unexpected
+// response can't accidentally let a call through.
+function handleElicitResponse(msg) {
+  const pending = pendingElicitations.get(msg.id);
+  if (!pending) return; // not one of ours (shouldn't happen -- caller checks first)
+
+  if (msg.error) {
+    pending.resolve("denied");
+    return;
+  }
+  const action = msg.result?.action;
+  if (action === "cancel") {
+    pending.resolve("cancelled");
+  } else if (action === "accept" && msg.result?.content?.approve === "approve") {
+    pending.resolve("approved");
+  } else {
+    // decline, or accept with any other content -- both deny
+    pending.resolve("denied");
+  }
+}
+
 // Opens /dev/tty and asks one y/n question, then closes it immediately.
 // /dev/tty is deliberately NOT held open between prompts: on macOS (and
 // most Unixes) it resolves to the same underlying terminal device as
@@ -285,14 +421,21 @@ process.stdin.on("data", (chunk) => {
 });
 process.stdin.on("end", () => child.stdin.end());
 
-// Parses a raw line from the client. Non-JSON-RPC or non-tools/call
-// lines are forwarded untouched -- policy only ever looks at tools/call.
+// Parses a raw line from the client. Non-JSON-RPC lines are forwarded
+// untouched. Two kinds of lines get special handling before the general
+// tools/call check:
+//   - `initialize` requests are inspected (not modified) to learn whether
+//     the client supports elicitation, then forwarded like anything else.
+//   - Replies to may-i's own outstanding elicitation requests are
+//     recognized by id, consumed here, and NOT forwarded -- the child
+//     server never sent that request and knows nothing about it.
 // A tools/call line is checked against policy before forwarding; on
-// deny (including an ask that gets refused or times out), the line
-// never reaches the server and an error goes back to the client on
-// stdout instead. This is async because "ask" waits on a human, but the
-// caller (the stdin drain loop) does NOT await it -- so a slow human
-// answering one prompt never blocks any other line already in flight.
+// deny (including an ask that gets refused, cancelled, or times out),
+// the line never reaches the server and an error goes back to the
+// client on stdout instead. This is async because "ask" waits on a
+// human, but the caller (the stdin drain loop) does NOT await it -- so a
+// slow human answering one prompt never blocks any other line already
+// in flight.
 async function handleClientLine(line) {
   let msg;
   try {
@@ -301,6 +444,23 @@ async function handleClientLine(line) {
     child.stdin.write(line + "\n"); // not JSON -- not ours to inspect, pass through
     return;
   }
+
+  if (msg.method === "initialize") {
+    inspectInitialize(msg);
+    child.stdin.write(line + "\n");
+    return;
+  }
+
+  // A response (has an id, no method) addressed to one of may-i's own
+  // elicitation requests. Checked before the tools/call branch since
+  // these are responses, not requests, and would otherwise just fall
+  // through untouched to the child -- which must never see them, since
+  // it never sent the matching request and has no id to match it to.
+  if (msg.method === undefined && msg.id !== undefined && pendingElicitations.has(msg.id)) {
+    handleElicitResponse(msg);
+    return; // consumed -- not the server's traffic, never forwarded
+  }
+
   if (msg.method !== "tools/call") {
     child.stdin.write(line + "\n");
     return;
@@ -314,7 +474,11 @@ async function handleClientLine(line) {
   let verdictLabel = action;
 
   if (action === "ask") {
-    const outcome = await askHuman(msg.id, name, args); // "approved" | "denied"
+    // "approved" | "denied" | "cancelled" (elicitation only -- the tty
+    // path never produces "cancelled", it only ever approves or denies).
+    const outcome = (elicitationSupport.form || elicitationSupport.url)
+      ? await askViaElicitation(name, args)
+      : await askHuman(msg.id, name, args);
     decision = outcome === "approved" ? "allow" : "deny";
     verdictLabel = `ask→${outcome}`;
   }
