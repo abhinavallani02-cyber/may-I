@@ -1,0 +1,20 @@
+{
+  "package": "mcp-server-git",
+  "version": "2026.8.18",
+  "source": "tools/list",
+  "command": "PYTHONPATH=<install> python3 -m mcp_server_git",
+  "tools": [
+    "git_add",
+    "git_branch",
+    "git_checkout",
+    "git_commit",
+    "git_create_branch",
+    "git_diff",
+    "git_diff_staged",
+    "git_diff_unstaged",
+    "git_log",
+    "git_reset",
+    "git_show",
+    "git_status"
+  ]
+}

@@ -103,7 +103,7 @@ change anything.
 ## Usage
 
 ```
-mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
+mayi [--rules <pack>] [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
 ```
 
 Everything after `--` is the real MCP server to spawn and front. For
@@ -121,9 +121,15 @@ perspective nothing else changes.
 
 Flags:
 
+- `--rules <pack>` — load a rule pack shipped with may-i:
+  `filesystem`, `git`, `github`, or `postgres` (`rules/<pack>.yaml` next
+  to the program, not in the working directory). The name is not a path.
+  Anything else — an unknown name, a slash, `..`, a blank — is a startup
+  error. may-i exits before it spawns the server. It does not fall back
+  to `./policy.yaml`, the built-in policy, or allow.
 - `--policy <file>` — path to the policy YAML file. Defaults to
-  `policy.yaml` in the current directory if it exists, otherwise the
-  built-in default described above.
+  `policy.yaml` in the current directory if it exists and `--rules` was
+  not given, otherwise the built-in default described above.
 - `--audit <file>` — path to the audit log. Defaults to `audit.jsonl`.
 - `--audit-include-args` — include each call's arguments in the audit log.
   Off by default; see [Audit logging](#audit-logging).
@@ -139,6 +145,20 @@ Flags:
   every `ask` asks and the remember option is not offered. Must be a
   non-negative integer. See [Session grants](#session-grants).
 - `-h`, `--help` — print usage and exit.
+
+`--rules` and `--policy` combine by concatenation, pack first. Flag
+order on the command line does not change that. First match still wins,
+so a pack `deny` or `ask` is not relaxed by an `allow` later in
+`--policy`. The policy file only sees calls the pack did not match.
+`--rules` alone does not also read `./policy.yaml`. Packs shipped here
+do not end with `tool: "*"`, so a policy file can still name a tool the
+pack left out. If nothing matches, the call asks.
+
+```
+mayi --rules postgres --policy extra.yaml -- npx -y @modelcontextprotocol/server-postgres postgresql://localhost/mydb
+```
+
+That checks `rules/postgres.yaml`, then `extra.yaml`.
 
 Working on may-i itself? Clone the repo and run it straight from source
 instead of installing — replace `mayi` above with `node mayi.mjs`:
@@ -180,7 +200,8 @@ rules:
     action: ask
 ```
 
-`path_prefix` is checked against `path`, `source`, and `destination`.
+`path_prefix` is checked against `path`, `source`, `destination`, and
+`repo_path` (the argument mcp-server-git uses).
 The value is canonicalized before the comparison, so `..`, `.`, and
 duplicate slashes cannot walk out of it: `path_prefix: /prod` matches
 `/prod`, `/prod/db`, `/prod/../prod/db`, `/prod//db`, and `/prod/./db`.
@@ -244,9 +265,14 @@ like another statement and the allow does not match. Backslash escapes
 inside quotes are not honored, so some MySQL strings look unparseable
 and fail closed rather than matching.
 
-A structural miss is not a new verdict. The audit label is still `allow`,
-`deny`, or an `ask→…` outcome from the rule that matched, or from the
-default ask. Nothing in this check fails open into an allow.
+When that check blocks an allow — compound or unparseable SQL, or a
+path that cannot be resolved — the audit verdict is annotated
+`blocked-allow`. A later deny is `deny(blocked-allow)`. A later ask is
+`ask→denied(blocked-allow)`, `ask→approved(blocked-allow)`, or
+`ask→cancelled(blocked-allow)`. A tty fallback keeps its own label and
+adds this one: `ask→approved(tty-fallback,blocked-allow)` or
+`ask→denied(tty-fallback,blocked-allow)`. A normal deny or ask, where
+no allow was blocked, stays `deny` or `ask→…` with no annotation.
 
 The three actions:
 
@@ -305,6 +331,33 @@ again for a while. The human chooses that at approval time.
   `session` scope sent anyway is ignored, and that approval applies to
   the one call only. The tty prompt stays `y`/`n`, and `a` is not an
   approval in that mode. Every `ask` asks.
+- A grant does not cover a call whose `allow` was structurally blocked
+  (compound or unparseable SQL, or a path that could not be resolved),
+  and approving that call does not create one. Pack rules are compiled
+  in front of `--policy`, and the grant key uses that combined position,
+  so the same rule text at a different index does not share a grant.
+
+## Rule packs
+
+`rules/` holds a policy for each server below. Each file's header names
+the package version and what the pack allows, asks, and denies.
+`npm test` checks every rule against that server's tool list: a glob or
+name that matches nothing is a failure. `filesystem` is checked by
+spawning `@modelcontextprotocol/server-filesystem` and calling
+`tools/list`. `git`, `github`, and `postgres` are checked against
+`rules/snapshots/*.json`, each captured the same way from the real
+package because those servers are not installed with may-i.
+
+| Pack | Server | Tool list |
+| --- | --- | --- |
+| `filesystem` | `@modelcontextprotocol/server-filesystem` 2026.7.10 | live `tools/list` |
+| `git` | `mcp-server-git` 2026.8.18 (PyPI) | snapshot of `tools/list` |
+| `github` | `github/github-mcp-server` v1.12.2, `stdio --toolsets=all` | snapshot of `tools/list` |
+| `postgres` | `@modelcontextprotocol/server-postgres` 0.6.2 | snapshot of `tools/list` |
+
+```
+mayi --rules filesystem -- npx -y @modelcontextprotocol/server-filesystem /path/to/allow
+```
 
 ## Audit logging
 
@@ -329,7 +382,12 @@ shows that fallback apart from a normal answer. A fallback that cannot
 ask (no tty, timeout, or error) is `ask→denied(tty-fallback)` — never an
 allow. Creating a grant also logs a stderr line,
 `[GRANT] tool=<name> rule=<rule> ttl=<seconds>s`, which is not an audit
-verdict.
+verdict. When a structural check blocked an allow before this decision,
+the same verdict carries `blocked-allow` as well: `deny(blocked-allow)`,
+`ask→denied(blocked-allow)`, or
+`ask→approved(tty-fallback,blocked-allow)`. A grant is not applied in
+that case, so the verdict is not `ask→granted(session)`. See
+[Policy](#policy).
 
 By default the log records only the decision: timestamp, request id, tool
 name, and verdict. It does **not** include the call's arguments — file

@@ -17,7 +17,10 @@
 import { realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 
-const PATH_ARG_KEYS = ["path", "source", "destination"];
+// `repo_path` is what mcp-server-git calls the repository. It is checked
+// the same way as path/source/destination so a path_prefix cannot be
+// walked out of with `..` on a git tool either.
+const PATH_ARG_KEYS = ["path", "source", "destination", "repo_path"];
 const SQL_ARG_KEYS = ["sql", "query", "statement"];
 
 const VERB = /^[A-Za-z_][A-Za-z0-9_]*$/;

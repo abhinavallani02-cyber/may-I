@@ -33,20 +33,25 @@ import { readFileSync, createReadStream, createWriteStream, appendFileSync, exis
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { parse as parseYaml } from "yaml";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { compileStructural, evaluateStructural } from "./structural.mjs";
 
 const HELP_TEXT = `mayi -- an MCP proxy that enforces allow/deny/ask policy on tool calls
 
 Usage:
-  mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
+  mayi [--rules <pack>] [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
 
 Everything after -- is the real MCP server to spawn and front.
 
 Options:
+  --rules <pack>        Rule pack from rules/<pack>.yaml (filesystem, git,
+                         github, postgres). Checked before --policy. An
+                         unknown name is a startup error. See the README.
   --policy <file>       Policy YAML file. Defaults to ./policy.yaml if it
-                         exists, otherwise a built-in conservative default
-                         (reads allowed, everything else asks).
+                         exists and --rules was not given, otherwise a
+                         built-in conservative default (reads allowed,
+                         everything else asks).
   --audit <file>        Audit log path. Defaults to ./audit.jsonl.
   --audit-include-args  Include call arguments in the audit log. Off by
                          default -- arguments can carry file contents,
@@ -154,6 +159,27 @@ function loadPolicyFile(path) {
     process.exit(1);
   }
   return parsed;
+}
+
+// Packs live next to this file, not in the process cwd, so `mayi
+// --rules filesystem` loads the installed pack rather than whatever
+// rules/ happens to be in the working directory. The name is not a
+// path: slashes, dots, and `..` are rejected so this cannot be pointed
+// at an arbitrary file.
+const RULES_DIR = join(dirname(fileURLToPath(import.meta.url)), "rules");
+const PACK_NAME = /^[a-z0-9][a-z0-9-]*$/;
+
+function loadPack(name) {
+  if (typeof name !== "string" || !PACK_NAME.test(name)) {
+    console.error(`mayi: --rules needs a pack name (lowercase letters, digits, hyphens), got ${name === undefined ? "nothing" : JSON.stringify(name)}`);
+    process.exit(1);
+  }
+  const path = join(RULES_DIR, `${name}.yaml`);
+  if (!existsSync(path)) {
+    console.error(`mayi: unknown rules pack ${JSON.stringify(name)}`);
+    process.exit(1);
+  }
+  return { path, policy: loadPolicyFile(path) };
 }
 
 // Appends one decision to the audit log. fs.appendFileSync issues a
@@ -314,6 +340,17 @@ function rememberSessionGrant(toolName, rule, matchedRule) {
   if (key == null) return;
   sessionGrants.set(key, { expiresAt: monotonicNow() + grantTtlSeconds * 1000 });
   console.error(`[GRANT] tool=${toolName} rule=${matchedRule} ttl=${grantTtlSeconds}s`);
+}
+
+// A structural check that blocked an allow (compound or unparseable SQL,
+// or a path that could not be resolved) gets its own audit annotation,
+// including when the call then hits a later deny or ask. Parentheses
+// already used by tty-fallback stay one pair: the annotation is added
+// inside them.
+function verdictWithBlockedAllow(verdict, blockedAllow) {
+  if (!blockedAllow) return verdict;
+  if (verdict.endsWith(")")) return `${verdict.slice(0, -1)},blocked-allow)`;
+  return `${verdict}(blocked-allow)`;
 }
 
 const ASK_TIMEOUT_MS = 30000;
@@ -713,7 +750,13 @@ async function handleClientLine(line) {
   const { name, arguments: args } = msg.params ?? {};
   console.error(`[INSPECT] id=${msg.id} tool=${name} args=${JSON.stringify(args)}`);
 
-  const { action, matchedRule, rule } = decide(name, args);
+  let { action, matchedRule, blockedAllow, rule } = decide(name, args);
+  // decide() skips allows after a structural block. If that invariant
+  // ever slipped, do not forward: an allow that was blocked is a deny.
+  if (blockedAllow && action === "allow") {
+    action = "deny";
+    matchedRule = `${matchedRule} (blocked-allow)`;
+  }
   let decision = action;
   let verdictLabel = action;
 
@@ -723,8 +766,11 @@ async function handleClientLine(line) {
     // grant cannot turn a denied call into an allow, including after
     // the policy is recompiled and a different rule matches. The audit
     // label stays ask→granted(session) so it can't be read as a plain
-    // policy allow.
-    if (matchingSessionGrant(name, rule)) {
+    // policy allow. A structural block (compound SQL, unparseable SQL,
+    // or a path that could not be resolved) also skips the grant: the
+    // allow that was meant to cover a safe call did not match, and a
+    // remembered ask must not let that call through.
+    if (!blockedAllow && matchingSessionGrant(name, rule)) {
       decision = "allow";
       verdictLabel = "ask→granted(session)";
     } else {
@@ -742,9 +788,10 @@ async function handleClientLine(line) {
       const approved = outcome === "approved" || outcome === "approved(tty-fallback)";
       decision = approved ? "allow" : "deny";
       verdictLabel = `ask→${outcome}`;
-      if (approved && remember) rememberSessionGrant(name, rule, matchedRule);
+      if (approved && remember && !blockedAllow) rememberSessionGrant(name, rule, matchedRule);
     }
   }
+  verdictLabel = verdictWithBlockedAllow(verdictLabel, blockedAllow);
 
   console.error(`[VERDICT] id=${msg.id} tool=${name} decision=${verdictLabel}`);
   appendAudit(msg.id, name, verdictLabel, args);
@@ -792,30 +839,43 @@ function main() {
     grantTtlSeconds = parseNonNegativeInt(beforeSep[grantFlagIndex + 1], "--grant-ttl");
   }
   sessionGrants.clear();
+  const rulesFlagIndex = beforeSep.indexOf("--rules");
+  const packName = rulesFlagIndex === -1 ? null : beforeSep[rulesFlagIndex + 1];
+  if (rulesFlagIndex !== -1 && (packName === undefined || packName.startsWith("--"))) {
+    console.error("mayi: --rules needs a pack name");
+    process.exit(1);
+  }
   const [command, ...args] = process.argv.slice(sepIndex + 1);
 
-  // Zero-config fallback: if no --policy was given and there's no
-  // policy.yaml in the current directory, use a built-in conservative
-  // default rather than requiring a config file to exist before may-i can
-  // run at all. Reads are safe on their own; everything else asks, so a
-  // brand-new user gets prompted rather than silently allowed or blocked.
-  let policyPath = explicitPolicyPath;
-  let policySource;
-  if (policyPath) {
-    if (!existsSync(policyPath)) {
-      console.error(`mayi: policy file not found: ${policyPath}`);
+  // Pack rules are always first when --rules is set, then --policy.
+  // First match wins, so a pack deny or ask cannot be relaxed by a
+  // later allow. --rules without --policy does not also read
+  // ./policy.yaml: that file is only the fallback when neither flag
+  // is present. An unknown pack exits in loadPack before the server
+  // is spawned.
+  const ruleLists = [];
+  const sources = [];
+  if (packName !== null) {
+    const pack = loadPack(packName);
+    ruleLists.push(pack.policy.rules);
+    sources.push(`rules pack ${packName} (${pack.path})`);
+  }
+  if (explicitPolicyPath) {
+    if (!existsSync(explicitPolicyPath)) {
+      console.error(`mayi: policy file not found: ${explicitPolicyPath}`);
       process.exit(1);
     }
-    policy = loadPolicyFile(policyPath);
-    policySource = policyPath;
-  } else if (existsSync("policy.yaml")) {
-    policyPath = "policy.yaml";
-    policy = loadPolicyFile(policyPath);
-    policySource = policyPath;
-  } else {
-    policy = BUILTIN_DEFAULT_POLICY;
-    policySource = "built-in default (reads allowed, everything else asks)";
+    ruleLists.push(loadPolicyFile(explicitPolicyPath).rules);
+    sources.push(explicitPolicyPath);
+  } else if (packName === null && existsSync("policy.yaml")) {
+    ruleLists.push(loadPolicyFile("policy.yaml").rules);
+    sources.push("policy.yaml");
+  } else if (packName === null) {
+    ruleLists.push(BUILTIN_DEFAULT_POLICY.rules);
+    sources.push("built-in default (reads allowed, everything else asks)");
   }
+  policy = { rules: ruleLists.flat() };
+  const policySource = sources.join(", then ");
   try {
     compileRules(policy.rules);
   } catch (err) {

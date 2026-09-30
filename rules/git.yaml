@@ -1,0 +1,41 @@
+# rules/git.yaml
+#
+# Server: mcp-server-git 2026.8.18 (PyPI). Tool list captured by
+# tools/list from `python -m mcp_server_git`. Snapshot:
+# rules/snapshots/git.json. This version has no push tool.
+#
+# Allows inspection: git_status, git_diff, git_diff_unstaged,
+# git_diff_staged, git_log, git_show, git_branch.
+# Asks before git_add, git_commit, git_reset, git_checkout, and
+# git_create_branch.
+#
+# repo_path is not confined here. There is no single directory that is
+# safe for every install. path_prefix does check repo_path when a rule
+# sets it, but this pack is checked before --policy, so these allows
+# match first. To confine a repository, write a policy file and do not
+# load this pack.
+#
+# No catch-all. A tool added in a later server release asks.
+
+rules:
+  - tool: git_status
+    action: allow
+  - tool: git_diff*
+    action: allow
+  - tool: git_log
+    action: allow
+  - tool: git_show
+    action: allow
+  - tool: git_branch
+    action: allow
+
+  - tool: git_add
+    action: ask
+  - tool: git_commit
+    action: ask
+  - tool: git_reset
+    action: ask
+  - tool: git_checkout
+    action: ask
+  - tool: git_create_branch
+    action: ask

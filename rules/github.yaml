@@ -1,0 +1,78 @@
+# rules/github.yaml
+#
+# Server: github/github-mcp-server v1.12.2, the official GitHub MCP
+# server (stdio binary, not the retired @modelcontextprotocol/server-github
+# npm package). Tool list captured by tools/list from
+# `github-mcp-server stdio --toolsets=all`, which is the default set
+# plus every optional toolset. Snapshot: rules/snapshots/github.json.
+#
+# Allows reads: get_*, list_*, search_*, and the read tools whose names
+# do not use those prefixes (issue_read, pull_request_read,
+# actions_get, actions_list, projects_get, projects_list, and the
+# *_read tools).
+#
+# Asks for writes: add_*, create_*, update_*, *_write, assign_copilot*,
+# manage_*, and the mutating tools those globs miss (delete, fork,
+# merge, push, star, notifications, triggering a workflow, requesting
+# a Copilot review).
+#
+# A tool that matches none of these asks, via --policy or the default
+# ask. No catch-all, so a pack ask cannot be relaxed by a later allow,
+# and a tool this file does not name can still be covered by --policy.
+
+rules:
+  - tool: get_*
+    action: allow
+  - tool: list_*
+    action: allow
+  - tool: search_*
+    action: allow
+  - tool: issue_read
+    action: allow
+  - tool: pull_request_read
+    action: allow
+  - tool: custom_properties_read
+    action: allow
+  - tool: repository_ruleset_read
+    action: allow
+  - tool: actions_get
+    action: allow
+  - tool: actions_list
+    action: allow
+  - tool: projects_get
+    action: allow
+  - tool: projects_list
+    action: allow
+
+  - tool: add_*
+    action: ask
+  - tool: create_*
+    action: ask
+  - tool: update_*
+    action: ask
+  - tool: "*_write"
+    action: ask
+  - tool: assign_copilot*
+    action: ask
+  - tool: manage_*
+    action: ask
+  - tool: delete_file
+    action: ask
+  - tool: fork_repository
+    action: ask
+  - tool: merge_pull_request
+    action: ask
+  - tool: push_files
+    action: ask
+  - tool: actions_run_trigger
+    action: ask
+  - tool: dismiss_notification
+    action: ask
+  - tool: mark_all_notifications_read
+    action: ask
+  - tool: request_copilot_review
+    action: ask
+  - tool: star_repository
+    action: ask
+  - tool: unstar_repository
+    action: ask

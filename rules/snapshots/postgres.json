@@ -1,0 +1,10 @@
+{
+  "package": "@modelcontextprotocol/server-postgres",
+  "version": "0.6.2",
+  "source": "tools/list",
+  "command": "node dist/index.js postgresql://localhost/postgres",
+  "note": "The server exits immediately if no database URL is given. tools/list does not open a connection; the URL is a placeholder so the process reaches the handler.",
+  "tools": [
+    "query"
+  ]
+}
