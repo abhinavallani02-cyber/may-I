@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // may-i -- MCP proxy with a policy engine and human-in-the-loop approval.
-// Spawns a real MCP server as a child process and forwards every line
-// stdin -> child.stdin and child.stdout -> stdout unchanged, EXCEPT
-// tools/call requests: those are checked against policy.yaml first.
+// The client always talks stdio to may-i. The upstream is a spawned
+// child (the default) or, with --upstream-url, a remote MCP server
+// reached through the SDK's Streamable HTTP or SSE client transport.
+// Stdio forwards every line stdin -> child.stdin and child.stdout ->
+// stdout unchanged, EXCEPT tools/call requests: those are checked
+// against policy.yaml first.
 //   allow -> forwarded to the server, like any other line
 //   deny  -> never reaches the server; a JSON-RPC error goes back to
 //            the client instead, on the same id
@@ -41,8 +44,12 @@ const HELP_TEXT = `mayi -- an MCP proxy that enforces allow/deny/ask policy on t
 
 Usage:
   mayi [--rules <pack>] [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
+  mayi [--rules <pack>] [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] --upstream-url <url> [--transport http|sse] [--bearer-env <NAME>]
 
-Everything after -- is the real MCP server to spawn and front.
+Stdio is the default: everything after -- is the MCP server to spawn.
+--upstream-url fronts a remote server instead. It cannot be combined
+with a child command. --transport defaults to http (streamable HTTP).
+sse is explicit; a failed http connection does not switch to sse.
 
 Options:
   --rules <pack>        Rule pack from rules/<pack>.yaml (filesystem, git,
@@ -66,16 +73,31 @@ Options:
                          stays in effect. Default 1800 (30 minutes).
                          0 disables session grants: every ask asks, and
                          the remember option is not offered.
+  --upstream-url <url>  Remote MCP endpoint (http or https). Mutually
+                         exclusive with a child command. Unreachable at
+                         startup is a non-zero exit.
+  --transport <http|sse>
+                        Upstream transport. http is streamable HTTP
+                         (default). sse is the legacy HTTP+SSE transport.
+                         Requires --upstream-url.
+  --bearer-env <NAME>   Send Authorization: Bearer from environment
+                         variable NAME. The value is never logged. Requires
+                         --upstream-url. OAuth is not supported.
   -h, --help            Show this help and exit.
 
 Example:
-  mayi --policy policy.yaml -- npx -y @modelcontextprotocol/server-filesystem /path/to/allow`;
+  mayi --policy policy.yaml -- npx -y @modelcontextprotocol/server-filesystem /path/to/allow
+  mayi --policy policy.yaml --upstream-url http://127.0.0.1:3000/mcp --bearer-env MAYI_TOKEN`;
 
 // Set in main() from argv, or by configureForTest(). Defaults match the
 // CLI defaults so a direct run that hasn't finished parsing yet still
 // fails closed if anything asks early.
 let auditPath = "audit.jsonl";
 let auditIncludeArgs = false;
+// Bearer tokens from --bearer-env. Empty in stdio mode, so audit and
+// inspect lines stay exactly as they were. When set, every log and
+// audit write passes through redact before it hits disk.
+let secretValues = [];
 // 750ms is above the ~400ms headless Claude Code auto-decline reported
 // on anthropics/claude-code#79174 (koshak01, rmcp 3.1.2, Claude Code
 // v2.1.227) and below the 1.8s human click may-i measured in Cursor
@@ -190,9 +212,32 @@ function loadPack(name) {
 // --audit-include-args -- off by default, since arguments can carry
 // file contents, paths, or other sensitive data that shouldn't land on
 // disk in plaintext without the operator opting in explicitly.
+function redactString(text, secrets) {
+  let out = String(text);
+  for (const secret of secrets) {
+    if (typeof secret === "string" && secret.length > 0) out = out.split(secret).join("[redacted]");
+  }
+  return out;
+}
+
+// With no secrets (stdio, or HTTP without --bearer-env) this returns
+// the same value, so the audit line is unchanged. With a bearer token,
+// the token is replaced before the line is written.
+function redactValue(value, secrets) {
+  if (!secrets || secrets.length === 0) return value;
+  if (typeof value === "string") return redactString(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => redactValue(item, secrets));
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) out[key] = redactValue(item, secrets);
+    return out;
+  }
+  return value;
+}
+
 function appendAudit(id, name, verdict, callArgs) {
   const entry = { timestamp: new Date().toISOString(), id, tool: name, verdict };
-  if (auditIncludeArgs) entry.args = callArgs;
+  if (auditIncludeArgs) entry.args = redactValue(callArgs, secretValues);
   appendFileSync(auditPath, JSON.stringify(entry) + "\n");
 }
 
@@ -347,10 +392,15 @@ function rememberSessionGrant(toolName, rule, matchedRule) {
 // including when the call then hits a later deny or ask. Parentheses
 // already used by tty-fallback stay one pair: the annotation is added
 // inside them.
+function annotateVerdict(verdict, tag) {
+  if (!tag) return verdict;
+  if (verdict.endsWith(")")) return `${verdict.slice(0, -1)},${tag})`;
+  return `${verdict}(${tag})`;
+}
+
 function verdictWithBlockedAllow(verdict, blockedAllow) {
   if (!blockedAllow) return verdict;
-  if (verdict.endsWith(")")) return `${verdict.slice(0, -1)},blocked-allow)`;
-  return `${verdict}(blocked-allow)`;
+  return annotateVerdict(verdict, "blocked-allow");
 }
 
 const ASK_TIMEOUT_MS = 30000;
@@ -717,6 +767,52 @@ let child = null;
 // human, but the caller (the stdin drain loop) does NOT await it -- so a
 // slow human answering one prompt never blocks any other line already
 // in flight.
+// Policy decision shared by stdio and HTTP. Does not forward and does
+// not write the audit line: the caller does, so a later upstream
+// failure can record a different verdict than a completed allow.
+async function adjudicateToolCall(id, name, args) {
+  let { action, matchedRule, blockedAllow, rule } = decide(name, args);
+  // decide() skips allows after a structural block. If that invariant
+  // ever slipped, do not forward: an allow that was blocked is a deny.
+  if (blockedAllow && action === "allow") {
+    action = "deny";
+    matchedRule = `${matchedRule} (blocked-allow)`;
+  }
+  let decision = action;
+  let verdictLabel = action;
+
+  if (action === "ask") {
+    // A remembered approval applies only while the rule that matches
+    // NOW is still an ask, and only when no allow was structurally
+    // blocked. A deny never enters this branch. A grant is not a plain
+    // allow: the audit label stays ask→granted(session). Remembering
+    // is also skipped when the allow was blocked, so a later compound
+    // statement or unresolvable path cannot ride an earlier approval.
+    if (!blockedAllow && matchingSessionGrant(name, rule)) {
+      decision = "allow";
+      verdictLabel = "ask→granted(session)";
+    } else {
+      // "approved" | "denied" | "cancelled" from elicitation, or
+      // "approved" | "denied" from the tty path. A too-fast decline or
+      // cancel comes back as "approved(tty-fallback)" or
+      // "denied(tty-fallback)" after askHuman runs. Only an explicit
+      // approval allows the call; the fallback forms are explicit too,
+      // and every error shape stays a deny. remember is a separate
+      // flag: the creating call is still an approval, and only later
+      // calls log ask→granted(session).
+      const { outcome, remember } = (elicitationSupport.form || elicitationSupport.url)
+        ? await askViaElicitation(id, name, args)
+        : outcomeFromHuman(await askHuman(id, name, args), { fallback: false });
+      const approved = outcome === "approved" || outcome === "approved(tty-fallback)";
+      decision = approved ? "allow" : "deny";
+      verdictLabel = `ask→${outcome}`;
+      if (approved && remember && !blockedAllow) rememberSessionGrant(name, rule, matchedRule);
+    }
+  }
+  verdictLabel = verdictWithBlockedAllow(verdictLabel, blockedAllow);
+  return { decision, verdictLabel, matchedRule };
+}
+
 async function handleClientLine(line) {
   let msg;
   try {
@@ -750,48 +846,7 @@ async function handleClientLine(line) {
   const { name, arguments: args } = msg.params ?? {};
   console.error(`[INSPECT] id=${msg.id} tool=${name} args=${JSON.stringify(args)}`);
 
-  let { action, matchedRule, blockedAllow, rule } = decide(name, args);
-  // decide() skips allows after a structural block. If that invariant
-  // ever slipped, do not forward: an allow that was blocked is a deny.
-  if (blockedAllow && action === "allow") {
-    action = "deny";
-    matchedRule = `${matchedRule} (blocked-allow)`;
-  }
-  let decision = action;
-  let verdictLabel = action;
-
-  if (action === "ask") {
-    // A remembered approval applies only while the rule that matches
-    // NOW is still an ask. A deny rule never enters this branch, so a
-    // grant cannot turn a denied call into an allow, including after
-    // the policy is recompiled and a different rule matches. The audit
-    // label stays ask→granted(session) so it can't be read as a plain
-    // policy allow. A structural block (compound SQL, unparseable SQL,
-    // or a path that could not be resolved) also skips the grant: the
-    // allow that was meant to cover a safe call did not match, and a
-    // remembered ask must not let that call through.
-    if (!blockedAllow && matchingSessionGrant(name, rule)) {
-      decision = "allow";
-      verdictLabel = "ask→granted(session)";
-    } else {
-      // "approved" | "denied" | "cancelled" from elicitation, or
-      // "approved" | "denied" from the tty path. A too-fast decline or
-      // cancel comes back as "approved(tty-fallback)" or
-      // "denied(tty-fallback)" after askHuman runs. Only an explicit
-      // approval allows the call; the fallback forms are explicit too,
-      // and every error shape stays a deny. remember is a separate
-      // flag: the creating call is still an approval, and only later
-      // calls log ask→granted(session).
-      const { outcome, remember } = (elicitationSupport.form || elicitationSupport.url)
-        ? await askViaElicitation(msg.id, name, args)
-        : outcomeFromHuman(await askHuman(msg.id, name, args), { fallback: false });
-      const approved = outcome === "approved" || outcome === "approved(tty-fallback)";
-      decision = approved ? "allow" : "deny";
-      verdictLabel = `ask→${outcome}`;
-      if (approved && remember && !blockedAllow) rememberSessionGrant(name, rule, matchedRule);
-    }
-  }
-  verdictLabel = verdictWithBlockedAllow(verdictLabel, blockedAllow);
+  const { decision, verdictLabel, matchedRule } = await adjudicateToolCall(msg.id, name, args);
 
   console.error(`[VERDICT] id=${msg.id} tool=${name} decision=${verdictLabel}`);
   appendAudit(msg.id, name, verdictLabel, args);
@@ -809,6 +864,237 @@ async function handleClientLine(line) {
   child.stdin.write(line + "\n");
 }
 
+// A flag that takes a value. Missing or looking like another flag is a
+// startup error. Returns null when the flag is absent.
+function readFlag(argv, flag) {
+  const index = argv.indexOf(flag);
+  if (index === -1) return null;
+  const value = argv[index + 1];
+  if (value === undefined || value.startsWith("--")) {
+    console.error(`mayi: ${flag} needs a value`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// --upstream-url, --transport, and --bearer-env. Exits on a bad
+// combination. Returns null when the operator asked for a stdio child.
+// The child command and a remote URL cannot both be set: there is no
+// defined order for two upstreams, and guessing would fail open.
+function resolveUpstream(beforeSep, commandArgs) {
+  const urlRaw = readFlag(beforeSep, "--upstream-url");
+  const transportRaw = readFlag(beforeSep, "--transport");
+  const bearerEnv = readFlag(beforeSep, "--bearer-env");
+  const wantsRemote = urlRaw !== null || transportRaw !== null || bearerEnv !== null;
+
+  if (!wantsRemote) return null;
+
+  if (urlRaw === null) {
+    console.error("mayi: --transport and --bearer-env require --upstream-url");
+    process.exit(1);
+  }
+  if (commandArgs.length > 0) {
+    console.error("mayi: --upstream-url cannot be combined with a child command. Use one upstream.");
+    process.exit(1);
+  }
+
+  let url;
+  try {
+    url = new URL(urlRaw);
+  } catch {
+    console.error("mayi: --upstream-url is not a URL");
+    process.exit(1);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    console.error("mayi: --upstream-url must be http or https");
+    process.exit(1);
+  }
+  // user:password@ would put a credential in argv and in the CONFIG
+  // line. Refuse it. The bearer token comes from the environment.
+  if (url.username || url.password) {
+    console.error("mayi: --upstream-url must not include a username or password; use --bearer-env");
+    process.exit(1);
+  }
+
+  const transport = transportRaw === null ? "http" : transportRaw;
+  if (transport !== "http" && transport !== "sse") {
+    console.error(`mayi: --transport must be http or sse, got ${JSON.stringify(transport)}`);
+    process.exit(1);
+  }
+
+  let bearerToken = null;
+  if (bearerEnv !== null) {
+    if (!ENV_NAME.test(bearerEnv)) {
+      console.error("mayi: --bearer-env needs an environment variable name");
+      process.exit(1);
+    }
+    const value = process.env[bearerEnv];
+    if (typeof value !== "string" || value.length === 0) {
+      console.error(`mayi: --bearer-env ${bearerEnv} is unset or empty`);
+      process.exit(1);
+    }
+    bearerToken = value;
+  }
+
+  return { url: url.href, transport, bearerEnv, bearerToken };
+}
+
+function writeClient(message) {
+  process.stdout.write(JSON.stringify(message) + "\n");
+}
+
+function safeErrorText(err) {
+  const message = err && err.message ? err.message : String(err);
+  return redactString(message, secretValues);
+}
+
+// HTTP/SSE mode. The SDK client connects before any client line is
+// read. If that connection fails, the process exits non-zero and no
+// tools/call is answered with a result. Policy is the same function
+// as stdio. A tools/call that policy allows is forwarded with
+// client.callTool; if the upstream drops, the client gets a JSON-RPC
+// error and the audit label is allow(upstream-error) or
+// ask→approved(upstream-error), never a bare allow.
+async function runUpstream(upstream) {
+  if (upstream.bearerToken) secretValues = [upstream.bearerToken];
+
+  console.error(`[CONFIG] upstream: ${upstream.transport} ${upstream.url}`);
+  console.error(`[CONFIG] upstream auth: ${upstream.bearerEnv ? `bearer from env ${upstream.bearerEnv}` : "none"}`);
+
+  let session;
+  try {
+    const { openUpstream } = await import("./upstream.mjs");
+    session = await openUpstream({
+      url: upstream.url,
+      transport: upstream.transport,
+      bearerToken: upstream.bearerToken,
+    });
+  } catch (err) {
+    console.error(`mayi: upstream unreachable (${safeErrorText(err)})`);
+    process.exit(1);
+  }
+
+  const { SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } = await import("@modelcontextprotocol/sdk/types.js");
+
+  function protocolVersionFor(requested) {
+    if (typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)) return requested;
+    return DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
+  }
+
+  console.error("[CONFIG] upstream: connected");
+
+  async function handleUpstreamLine(line) {
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      // No byte pipe to forward on. A non-JSON line cannot be allowed.
+      console.error("mayi: ignoring a non-JSON line from the client");
+      return;
+    }
+
+    if (msg.method === "initialize") {
+      inspectInitialize(msg);
+      writeClient({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          protocolVersion: protocolVersionFor(msg.params?.protocolVersion),
+          capabilities: session.capabilities,
+          serverInfo: session.serverVersion,
+        },
+      });
+      return;
+    }
+
+    if (msg.method === undefined && msg.id !== undefined && pendingElicitations.has(msg.id)) {
+      handleElicitResponse(msg);
+      return;
+    }
+
+    // Notifications have no result. Do not answer them with a success.
+    if (msg.id === undefined || msg.id === null) return;
+
+    if (msg.method === "tools/list" || msg.method === "ping") {
+      try {
+        const result = msg.method === "ping" ? await session.ping() : await session.listTools();
+        writeClient({ jsonrpc: "2.0", id: msg.id, result });
+      } catch (err) {
+        writeClient({
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: { code: -32000, message: `Upstream error: ${safeErrorText(err)}` },
+        });
+      }
+      return;
+    }
+
+    if (msg.method !== "tools/call") {
+      writeClient({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32601, message: `mayi: method not proxied over this transport: ${msg.method}` },
+      });
+      return;
+    }
+
+    const { name, arguments: args } = msg.params ?? {};
+    console.error(`[INSPECT] id=${msg.id} tool=${name} args=${redactString(JSON.stringify(args), secretValues)}`);
+
+    const { decision, verdictLabel, matchedRule } = await adjudicateToolCall(msg.id, name, args);
+    if (decision === "deny") {
+      console.error(`[VERDICT] id=${msg.id} tool=${name} decision=${verdictLabel}`);
+      appendAudit(msg.id, name, verdictLabel, args);
+      writeClient({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32602, message: `Blocked by policy: ${matchedRule}` },
+      });
+      return;
+    }
+
+    try {
+      const result = await session.callTool(name, args ?? {});
+      console.error(`[VERDICT] id=${msg.id} tool=${name} decision=${verdictLabel}`);
+      appendAudit(msg.id, name, verdictLabel, args);
+      writeClient({ jsonrpc: "2.0", id: msg.id, result });
+    } catch (err) {
+      // Policy said allow (or a human approved) but the upstream did
+      // not return a result. That is not an allow.
+      const label = annotateVerdict(verdictLabel, "upstream-error");
+      console.error(`[VERDICT] id=${msg.id} tool=${name} decision=${label}`);
+      appendAudit(msg.id, name, label, args);
+      writeClient({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32000, message: `Upstream error: ${safeErrorText(err)}` },
+      });
+    }
+  }
+
+  let stdinBuffer = "";
+  process.stdin.on("data", (chunk) => {
+    stdinBuffer += chunk.toString();
+    let newlineIndex;
+    while ((newlineIndex = stdinBuffer.indexOf("\n")) !== -1) {
+      const line = stdinBuffer.slice(0, newlineIndex);
+      stdinBuffer = stdinBuffer.slice(newlineIndex + 1);
+      handleUpstreamLine(line);
+    }
+  });
+  process.stdin.on("end", () => {
+    session.close().finally(() => process.exit(0));
+  });
+
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(sig, () => {
+      session.close().finally(() => process.exit(0));
+    });
+  }
+}
+
 // Wires stdio, spawns the real server, and stays alive. Not run when
 // this file is imported by the test suite -- see isDirectRun() below.
 function main() {
@@ -818,13 +1104,15 @@ function main() {
   }
 
   const sepIndex = process.argv.indexOf("--");
-  if (sepIndex === -1 || sepIndex === process.argv.length - 1) {
+  const beforeSep = sepIndex === -1 ? process.argv.slice(2) : process.argv.slice(2, sepIndex);
+  const commandArgs = sepIndex === -1 ? [] : process.argv.slice(sepIndex + 1);
+  const upstream = resolveUpstream(beforeSep, commandArgs);
+  if (!upstream && (sepIndex === -1 || commandArgs.length === 0)) {
     console.error("mayi: no server command given -- everything after \"--\" is the command to run.");
     console.error();
     console.error(HELP_TEXT);
     process.exit(1);
   }
-  const beforeSep = process.argv.slice(2, sepIndex);
   const policyFlagIndex = beforeSep.indexOf("--policy");
   const explicitPolicyPath = policyFlagIndex === -1 ? null : beforeSep[policyFlagIndex + 1];
   const auditFlagIndex = beforeSep.indexOf("--audit");
@@ -845,7 +1133,7 @@ function main() {
     console.error("mayi: --rules needs a pack name");
     process.exit(1);
   }
-  const [command, ...args] = process.argv.slice(sepIndex + 1);
+  const [command, ...args] = commandArgs;
 
   // Pack rules are always first when --rules is set, then --policy.
   // First match wins, so a pack deny or ask cannot be relaxed by a
@@ -887,6 +1175,14 @@ function main() {
   console.error(`[CONFIG] audit mode: ${auditIncludeArgs ? "decisions + args" : "decisions only"}`);
   console.error(`[CONFIG] elicit auto-decline: ${elicitAutoDeclineMs === 0 ? "off" : elicitAutoDeclineMs + "ms"}`);
   console.error(`[CONFIG] session grants: ${grantsEnabled() ? grantTtlSeconds + "s" : "off"}`);
+
+  if (upstream) {
+    runUpstream(upstream).catch((err) => {
+      console.error(`mayi: ${safeErrorText(err)}`);
+      process.exit(1);
+    });
+    return;
+  }
 
   child = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });
 

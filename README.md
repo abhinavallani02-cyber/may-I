@@ -18,9 +18,10 @@ server, to enforce them itself.
 
 ## Status
 
-Early and small. It has only been tested against one server
-(`@modelcontextprotocol/server-filesystem`) over stdio, which is currently
-the only transport it supports — no HTTP or SSE. Policy matching is a
+Early and small. Stdio is the default. It has been tested against
+`@modelcontextprotocol/server-filesystem` that way, and the suite also
+stands up a local streamable-HTTP server (and a legacy SSE server) to
+exercise `--upstream-url`. OAuth is not implemented. Policy matching is a
 tool-name glob, then a structural check only when a rule asks for one:
 a canonical `path_prefix`, or `sql.single` for one SQL statement of a
 named type. There is no general condition language yet. It has not had a
@@ -104,10 +105,16 @@ change anything.
 
 ```
 mayi [--rules <pack>] [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
+mayi [--rules <pack>] [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] --upstream-url <url> [--transport http|sse] [--bearer-env <NAME>]
 ```
 
-Everything after `--` is the real MCP server to spawn and front. For
-example, to guard the filesystem server with your own policy:
+Stdio is the default. Everything after `--` is the real MCP server to
+spawn and front. `--upstream-url` is the other mode: may-i connects to
+a remote MCP endpoint and the client still talks stdio to may-i. The
+two are mutually exclusive. Passing both, or passing `--transport` /
+`--bearer-env` without `--upstream-url`, is a startup error. may-i
+exits before it spawns a child or accepts tool calls. For example, to
+guard the filesystem server with your own policy:
 
 ```
 mayi --policy policy.yaml --audit audit.jsonl -- \
@@ -144,6 +151,25 @@ Flags:
   effect. Default `1800` (30 minutes). `0` disables session grants, so
   every `ask` asks and the remember option is not offered. Must be a
   non-negative integer. See [Session grants](#session-grants).
+- `--upstream-url <url>` — connect to a remote MCP server instead of
+  spawning one. `http` or `https` only. A URL with a username or
+  password is a startup error. If the endpoint is unreachable, may-i
+  exits non-zero before it reads client traffic. It does not fall open
+  and answer calls itself.
+- `--transport http|sse` — which SDK client transport to use.
+  `http` (the default) is `StreamableHTTPClientTransport`. `sse` is
+  `SSEClientTransport`. There is no automatic fallback: if streamable
+  HTTP fails, may-i exits. It does not try SSE on its own. Point
+  `--transport sse` at an SSE endpoint when that is the server you mean.
+  Requires `--upstream-url`.
+- `--bearer-env <NAME>` — read a bearer token from the environment
+  variable `NAME` and send `Authorization: Bearer <value>` on upstream
+  requests. For SSE, the same header is sent on the opening event
+  stream and on later POSTs. The value is never written to stderr or
+  to the audit file (arguments that contain it are stored as
+  `[redacted]`). If `NAME` is not an environment-variable name, or the
+  variable is missing or empty, may-i exits before connecting. Requires
+  `--upstream-url`.
 - `-h`, `--help` — print usage and exit.
 
 `--rules` and `--policy` combine by concatenation, pack first. Flag
@@ -159,6 +185,37 @@ mayi --rules postgres --policy extra.yaml -- npx -y @modelcontextprotocol/server
 ```
 
 That checks `rules/postgres.yaml`, then `extra.yaml`.
+
+## Remote servers
+
+```
+mayi --policy policy.yaml --upstream-url http://127.0.0.1:3000/mcp --bearer-env MAYI_TOKEN
+mayi --policy policy.yaml --upstream-url http://127.0.0.1:3000/sse --transport sse
+```
+
+may-i opens the upstream with `@modelcontextprotocol/sdk`'s
+`StreamableHTTPClientTransport` or `SSEClientTransport` before it
+handles client traffic. The SDK performs that session's initialize.
+The client's own `initialize` is answered locally from the upstream
+server's advertised capabilities. `notifications/initialized` is
+accepted and not forwarded. `tools/list`, `ping`, and `tools/call` are
+forwarded. Any other request gets a JSON-RPC error. It is not treated
+as an allow.
+
+`tools/call` still goes through policy first. `deny`, and an `ask`
+that is not approved, never reach the upstream. An approved call that
+the upstream does not answer — the connection refused at startup is
+already an exit; a drop mid-session is an error on that call — is
+audited as `allow(upstream-error)` or
+`ask→approved(upstream-error)`, and the client receives a JSON-RPC
+error rather than a tool result. A tty-fallback approval that then
+loses the upstream is
+`ask→approved(tty-fallback,upstream-error)`.
+
+OAuth is out of scope. may-i does not run the MCP OAuth flow, open a
+browser, register a client, or refresh a token. A server that expects
+a bearer token already in hand is the `--bearer-env` case above.
+Any other authentication has to happen outside may-i.
 
 Working on may-i itself? Clone the repo and run it straight from source
 instead of installing — replace `mayi` above with `node mayi.mjs`:
@@ -387,7 +444,14 @@ the same verdict carries `blocked-allow` as well: `deny(blocked-allow)`,
 `ask→denied(blocked-allow)`, or
 `ask→approved(tty-fallback,blocked-allow)`. A grant is not applied in
 that case, so the verdict is not `ask→granted(session)`. See
-[Policy](#policy).
+[Policy](#policy). When an HTTP or SSE upstream accepts the policy
+decision but does not return a result (the session dropped, or the
+request failed in transit), the verdict is `allow(upstream-error)`,
+`ask→approved(upstream-error)`,
+`ask→approved(tty-fallback,upstream-error)`, or, when the call was
+allowed by a session grant, `ask→granted(session,upstream-error)`.
+That is not an allow: the client is sent an error, and the call is
+not retried.
 
 By default the log records only the decision: timestamp, request id, tool
 name, and verdict. It does **not** include the call's arguments — file

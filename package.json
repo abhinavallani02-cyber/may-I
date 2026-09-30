@@ -9,13 +9,14 @@
   "files": [
     "mayi.mjs",
     "structural.mjs",
+    "upstream.mjs",
     "rules",
     "policy.yaml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test-elicit-fallback.mjs && node test-grants.mjs && node test-structural.mjs && node test-rules.mjs"
+    "test": "node test-elicit-fallback.mjs && node test-grants.mjs && node test-structural.mjs && node test-rules.mjs && node test-http.mjs"
   },
   "keywords": [
     "mcp",
@@ -30,7 +31,9 @@
   },
   "type": "commonjs",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@modelcontextprotocol/server-filesystem": "^2026.7.10",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "zod": "^4.6.5"
   }
 }
