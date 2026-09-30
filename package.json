@@ -8,12 +8,13 @@
   },
   "files": [
     "mayi.mjs",
+    "structural.mjs",
     "policy.yaml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test-elicit-fallback.mjs && node test-grants.mjs"
+    "test": "node test-elicit-fallback.mjs && node test-grants.mjs && node test-structural.mjs"
   },
   "keywords": [
     "mcp",

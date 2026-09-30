@@ -20,7 +20,10 @@ rules:
   # Hard deny: writes/edits/moves/deletes/new-dirs under paths that
   # should never be touched by an agent, no matter what. These don't
   # even ask -- an ask you'll reflexively approve at 2am isn't a real
-  # control. path_prefix is checked against path/source/destination.
+  # control. path_prefix is a canonical, segment-bounded check against
+  # path/source/destination (see the README). /prod matches
+  # /prod/../prod/x and does not match /production. Symlinks are
+  # realpath'd when the path exists.
   - tool: write_file
     path_prefix: /etc
     action: deny
