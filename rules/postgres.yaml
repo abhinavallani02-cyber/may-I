@@ -1,0 +1,27 @@
+# rules/postgres.yaml
+#
+# Server: @modelcontextprotocol/server-postgres 0.6.2 (npm), the
+# archived reference server. It exposes one tool, `query`, whose
+# argument is `sql`. Tool list captured by tools/list. The process
+# refuses to start without a database URL, so the capture passed
+# postgresql://localhost/postgres; tools/list does not open a
+# connection. Snapshot: rules/snapshots/postgres.json.
+#
+# Allows one SELECT. A compound statement (SELECT 1; DROP TABLE users,
+# including a second statement after a comment) and anything the SQL
+# check cannot parse do not match this allow. The following rule denies
+# every other query call, so the compound statement is not saved by a
+# later allow. WITH and EXPLAIN are not listed: WITH ... DELETE is a
+# `with`, and EXPLAIN DELETE is an `explain`.
+#
+# The server wraps the string in a READ ONLY transaction. This pack
+# does not rely on that. node-postgres will still see multiple
+# statements in one string.
+
+rules:
+  - tool: query
+    sql:
+      single: select
+    action: allow
+  - tool: query
+    action: deny

@@ -1,0 +1,66 @@
+# rules/filesystem.yaml
+#
+# Server: @modelcontextprotocol/server-filesystem 2026.7.10 (npm).
+# Tool list taken by spawning that package and calling tools/list.
+# The test does the same against the installed copy.
+#
+# Allows every read on this server: read_*, list_*, directory_tree,
+# get_file_info, search_files. read_multiple_files takes a `paths`
+# array. path_prefix does not look inside arrays; the tool is allowed
+# because it only reads.
+#
+# Denies create/write/edit/move when path, source, or destination
+# canonicalizes under /etc or /prod. The check is segment-bounded and
+# resolves symlinks, so /prod/../etc/passwd is /etc and /prod does not
+# match /production.
+#
+# Asks for every other create/write/edit/move.
+# No catch-all: a tool this file does not name falls through to
+# --policy if one was given, then to the default ask.
+
+rules:
+  - tool: read_*
+    action: allow
+  - tool: list_*
+    action: allow
+  - tool: directory_tree
+    action: allow
+  - tool: get_file_info
+    action: allow
+  - tool: search_files
+    action: allow
+
+  - tool: write_*
+    path_prefix: /etc
+    action: deny
+  - tool: edit_*
+    path_prefix: /etc
+    action: deny
+  - tool: move_*
+    path_prefix: /etc
+    action: deny
+  - tool: create_*
+    path_prefix: /etc
+    action: deny
+
+  - tool: write_*
+    path_prefix: /prod
+    action: deny
+  - tool: edit_*
+    path_prefix: /prod
+    action: deny
+  - tool: move_*
+    path_prefix: /prod
+    action: deny
+  - tool: create_*
+    path_prefix: /prod
+    action: deny
+
+  - tool: write_*
+    action: ask
+  - tool: edit_*
+    action: ask
+  - tool: move_*
+    action: ask
+  - tool: create_*
+    action: ask

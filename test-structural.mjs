@@ -104,6 +104,11 @@ check("lexical path_prefix collapses .., ./, and duplicate slashes", () => {
   ];
   assert(decision(askRules, "write_file", { path: "/prod/../prod/x" }).action === "ask", "canonical /prod should ask");
   assert(decision(askRules, "write_file", { path: "/production" }).action === "allow", "/production must not ask as /prod");
+  const repoWalk = decision([
+    { tool: "git_*", path_prefix: "/etc", action: "deny" },
+    { tool: "*", action: "allow" },
+  ], "git_status", { repo_path: "/work/repo/../../etc" });
+  assert(repoWalk.action === "deny", `repo_path .. should hit /etc, got ${repoWalk.action} ${repoWalk.matchedRule}`);
 });
 
 check("glob is the first pass; a path rule does not see other tools", () => {
@@ -400,7 +405,7 @@ await checkAsync("audit labels stay allow, deny, and ask, and compound SQL is no
   assert(allowed.forwarded, "single select should be forwarded");
 
   const compound = await drive(SELECT_THEN_DENY, "query", { sql: "SELECT 1; DROP TABLE users" });
-  assert(compound.audit.length === 1 && compound.audit[0].verdict === "deny", JSON.stringify(compound.audit));
+  assert(compound.audit.length === 1 && compound.audit[0].verdict === "deny(blocked-allow)", JSON.stringify(compound.audit));
   assert(!compound.forwarded, "compound statement was forwarded");
   assert(compound.client.includes("Blocked by policy"), compound.client);
 
@@ -408,12 +413,19 @@ await checkAsync("audit labels stay allow, deny, and ask, and compound SQL is no
     { tool: "query", sql: { single: "select" }, action: "allow" },
   ];
   const unparsed = await drive(onlyAllow, "query", { sql: "SELECT '" }, "approved");
-  assert(unparsed.audit[0].verdict === "ask→approved", JSON.stringify(unparsed.audit));
+  assert(unparsed.audit[0].verdict === "ask→approved(blocked-allow)", JSON.stringify(unparsed.audit));
   assert(unparsed.forwarded, "a human yes on the fallback ask is an ask approval, not a structural allow");
 
   const unparsedDenied = await drive(onlyAllow, "query", { sql: "SELECT '" }, "denied");
-  assert(unparsedDenied.audit[0].verdict === "ask→denied", JSON.stringify(unparsedDenied.audit));
+  assert(unparsedDenied.audit[0].verdict === "ask→denied(blocked-allow)", JSON.stringify(unparsedDenied.audit));
   assert(!unparsedDenied.forwarded, "default ask must be able to deny an unparseable statement");
+
+  const unresolved = await drive([
+    { tool: "write_*", path_prefix: "/safe", action: "allow" },
+    { tool: "write_*", action: "deny" },
+  ], "write_file", { path: "/safe/ok\0" });
+  assert(unresolved.audit[0].verdict === "deny(blocked-allow)", JSON.stringify(unresolved.audit));
+  assert(!unresolved.forwarded, "unresolved path was forwarded");
 
   const walked = await drive([
     { tool: "write_*", path_prefix: "/etc", action: "deny" },
@@ -422,6 +434,54 @@ await checkAsync("audit labels stay allow, deny, and ask, and compound SQL is no
   assert(walked.audit[0].verdict === "deny", JSON.stringify(walked.audit));
   assert(!walked.forwarded, "canonical /etc write was forwarded");
   assert(walked.client.includes("path_prefix: /etc"), walked.client);
+});
+
+await checkAsync("blocked allow plus a tty fallback keeps both labels", async () => {
+  const childLines = [];
+  const clientChunks = [];
+  const auditFile = join(dir, "audit-tty-block.jsonl");
+  const t = 5000;
+  configureForTest({
+    rules: [{ tool: "query", sql: { single: "select" }, action: "allow" }],
+    auditFile,
+    autoDeclineMs: 750,
+    now: () => t,
+    childStdin: { write: (line) => childLines.push(String(line)) },
+    askHuman: () => "approved",
+  });
+  const origWrite = process.stdout.write.bind(process.stdout);
+  const origErr = console.error;
+  process.stdout.write = (chunk, enc, cb) => {
+    clientChunks.push(Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk));
+    const done = typeof enc === "function" ? enc : cb;
+    if (typeof done === "function") done();
+    return true;
+  };
+  console.error = () => {};
+  try {
+    await handleClientLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: { elicitation: { form: {} } }, clientInfo: { name: "fake", version: "0" } },
+    }));
+    const call = handleClientLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: { name: "query", arguments: { sql: "SELECT 1; DROP TABLE users" } },
+    }));
+    const elicit = clientChunks.join("").split("\n").filter(Boolean).map((line) => JSON.parse(line)).find((msg) => msg.method === "elicitation/create");
+    assert(elicit, "expected an elicitation");
+    await handleClientLine(JSON.stringify({ jsonrpc: "2.0", id: elicit.id, result: { action: "decline" } }));
+    await call;
+  } finally {
+    process.stdout.write = origWrite;
+    console.error = origErr;
+  }
+  const audit = readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert(audit.length === 1 && audit[0].verdict === "ask→approved(tty-fallback,blocked-allow)", JSON.stringify(audit));
+  assert(childLines.some((line) => line.includes('"tools/call"')), "human approval after a blocked allow should forward");
 });
 
 rmSync(dir, { recursive: true, force: true });
