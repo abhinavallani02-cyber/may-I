@@ -80,7 +80,7 @@ change anything.
 ## Usage
 
 ```
-mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] -- <command> [args...]
+mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
 ```
 
 Everything after `--` is the real MCP server to spawn and front. For
@@ -110,6 +110,10 @@ Flags:
   back to the `/dev/tty` prompt instead of recording a user denial.
   Default `250`. `0` disables the heuristic, so every non-accept is a
   real decision. Must be a non-negative integer.
+- `--grant-ttl <seconds>` — how long a remembered approval stays in
+  effect. Default `1800` (30 minutes). `0` disables session grants, so
+  every `ask` asks and the remember option is not offered. Must be a
+  non-negative integer. See [Session grants](#session-grants).
 - `-h`, `--help` — print usage and exit.
 
 Working on may-i itself? Clone the repo and run it straight from source
@@ -150,16 +154,57 @@ The three actions:
   logging beyond the normal verdict line.
 - **`deny`** — the call never reaches the server. may-i sends a JSON-RPC
   error back to the client on the same request id instead.
-- **`ask`** — may-i prints the tool name and arguments to the terminal and
-  waits (up to 30 seconds) for a human to type `y` or `n`. `y` forwards
-  the call as if it were `allow`; `n`, any other answer, or a timeout
-  denies it as if it were `deny`. If there's no controlling terminal to
-  ask (e.g. may-i's own input/output are both piped, with no tty attached),
-  `ask` always resolves to deny — there's no human to ask, so the safe
-  default applies.
+- **`ask`** — may-i prompts a human and waits up to 30 seconds. With
+  elicitation support, the form asks whether to approve and, unless
+  session grants are disabled, whether to remember that approval (see
+  [Session grants](#session-grants)). Otherwise it prompts on `/dev/tty`:
+  `y` approves this call, `n` denies it, and `a` approves and remembers
+  (`a` is not offered when grants are disabled). Any other answer, or a
+  timeout, denies the call. An approval is forwarded like `allow`; a
+  denial is rejected like `deny`. If there's no controlling terminal to
+  ask (e.g. may-i's own input/output are both piped, with no tty
+  attached), `ask` resolves to deny — there's no human to ask, so the
+  safe default applies.
 
 If no rule matches a call, may-i defaults to `ask` rather than silently
 allowing it.
+
+## Session grants
+
+An approval can be remembered so the same kind of call doesn't prompt
+again for a while. The human chooses that at approval time.
+
+- **Elicitation** asks two things: approve or deny, and a scope. `once`
+  is the default and covers this call only. `session` remembers the
+  approval. If `scope` is missing or is any value other than `session`,
+  nothing is remembered.
+- **`/dev/tty`** accepts `y` (approve once), `n` (deny), and `a`
+  (approve and remember). Only `a` creates a grant. A fast elicitation
+  auto-decline never does — if that fallback then gets an `a`, the
+  grant comes from that answer, not from the decline.
+- The grant key is the **tool name plus the matched policy rule**, not
+  the call's arguments. A rule's `path_prefix` (when it has one) is
+  already the argument scope the policy author wrote down, so
+  `sandbox/a` and `sandbox/b` can share a grant while a `write_file`
+  that matched a different rule cannot. The rule's identity is its
+  position in the policy plus its content, so two rules that would
+  otherwise look the same do not share a grant, and an edited rule
+  does not inherit an old one. A different tool name asks again even
+  when it matches the same glob. If there's any doubt the grant
+  applies, may-i asks again.
+- Grants apply only to **`ask` rules**. A `deny` is never grantable.
+  If the rule that matches a later call is `deny` — including after
+  the policy is changed so a previously approved call now hits a deny
+  rule — the grant is not used.
+- Grants live in memory for this process only. They are not written
+  to disk and disappear when may-i exits. `--grant-ttl` bounds each
+  one (default 30 minutes). Expired grants are removed the next time
+  an `ask` is checked, not by a background timer.
+- `--grant-ttl 0` turns this off, and the remember option is not
+  offered. The scope question is omitted from the elicitation form; a
+  `session` scope sent anyway is ignored, and that approval applies to
+  the one call only. The tty prompt stays `y`/`n`, and `a` is not an
+  approval in that mode. Every `ask` asks.
 
 ## Audit logging
 
@@ -171,12 +216,20 @@ the audit log as one JSON object per line:
 ```
 
 `ask` verdicts are `ask→approved`, `ask→denied`, or `ask→cancelled`.
-When a too-fast elicitation decline or cancel was treated as the client
-being unable to ask, and the terminal prompt decided instead, the
-verdict is `ask→approved(tty-fallback)` or `ask→denied(tty-fallback)`,
-so the log shows that fallback apart from a normal answer. A fallback
-that cannot ask (no tty, timeout, or error) is
-`ask→denied(tty-fallback)` — never an allow.
+A later call allowed because a human remembered an earlier approval is
+`ask→granted(session)`. That is not a plain `allow`: `allow` means the
+policy itself let the call through, and `ask→granted(session)` means a
+human allowed this tool and rule earlier in the process. The call that
+creates the grant is still `ask→approved` (or `ask→approved(tty-fallback)`
+when the terminal prompt was the one that answered). When a too-fast
+elicitation decline or cancel was treated as the client being unable to
+ask, and the terminal prompt decided instead, the verdict is
+`ask→approved(tty-fallback)` or `ask→denied(tty-fallback)`, so the log
+shows that fallback apart from a normal answer. A fallback that cannot
+ask (no tty, timeout, or error) is `ask→denied(tty-fallback)` — never an
+allow. Creating a grant also logs a stderr line,
+`[GRANT] tool=<name> rule=<rule> ttl=<seconds>s`, which is not an audit
+verdict.
 
 By default the log records only the decision: timestamp, request id, tool
 name, and verdict. It does **not** include the call's arguments — file

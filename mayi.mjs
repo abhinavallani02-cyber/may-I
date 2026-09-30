@@ -17,8 +17,13 @@
 //            actually ask (Claude Code VS Code bug
 //            anthropics/claude-code#79174). Either way: approve ->
 //            forwarded like allow. deny/cancel/timeout -> denied like
-//            deny. Other in-flight lines are NOT blocked while a prompt
-//            is pending -- only that one request waits.
+//            deny. An approval can also be remembered for this process:
+//            later calls that hit the same tool and the same ask rule
+//            are allowed without asking again, until the grant expires
+//            or may-i exits. Grants are never written to disk, and a
+//            deny rule is never satisfied by one. Other in-flight lines
+//            are NOT blocked while a prompt is pending -- only that one
+//            request waits.
 // Everything that isn't a tools/call request is still pure passthrough,
 // with one exception in the client->server direction: replies to
 // elicitation requests may-i itself originated. Those are addressed to
@@ -33,7 +38,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const HELP_TEXT = `mayi -- an MCP proxy that enforces allow/deny/ask policy on tool calls
 
 Usage:
-  mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] -- <command> [args...]
+  mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] [--grant-ttl <seconds>] -- <command> [args...]
 
 Everything after -- is the real MCP server to spawn and front.
 
@@ -50,6 +55,11 @@ Options:
                          is treated as the client auto-declining (no UI)
                          and falls back to the /dev/tty prompt. Default
                          250. 0 disables it.
+  --grant-ttl <seconds>
+                        How long an approval remembered for this session
+                         stays in effect. Default 1800 (30 minutes).
+                         0 disables session grants: every ask asks, and
+                         the remember option is not offered.
   -h, --help            Show this help and exit.
 
 Example:
@@ -61,12 +71,23 @@ Example:
 let auditPath = "audit.jsonl";
 let auditIncludeArgs = false;
 let elicitAutoDeclineMs = 250;
+// How long a remembered approval stays in effect, in seconds. 0 turns
+// session grants off entirely (the remember option is not offered, and
+// a scope/answer that asks to remember is ignored).
+const DEFAULT_GRANT_TTL_SECONDS = 1800;
+let grantTtlSeconds = DEFAULT_GRANT_TTL_SECONDS;
 
 // Replaced in tests so the suite can stub the terminal prompt and the
-// monotonic clock. The CLI leaves both null: askHuman reads /dev/tty,
-// and timestamps come from performance.now().
+// monotonic clock. The CLI leaves these null: askHuman reads /dev/tty,
+// and timestamps come from performance.now(). ttyAnswerOverride, when
+// set, skips opening /dev/tty but still runs the y/n/a classifier.
 let askHumanOverride = null;
+let ttyAnswerOverride = null;
 let clockOverride = null;
+
+function grantsEnabled() {
+  return grantTtlSeconds > 0;
+}
 
 function monotonicNow() {
   // performance.now() is monotonic (the same clock family as
@@ -152,7 +173,14 @@ function globToRegex(glob) {
 }
 let compiledRules = [];
 function compileRules(rules) {
-  compiledRules = rules.map((rule) => ({ ...rule, regex: globToRegex(rule.tool) }));
+  compiledRules = rules.map((rule, index) => {
+    const compiled = { ...rule, regex: globToRegex(rule.tool) };
+    // Non-enumerable so a hand-written `index:` field in the YAML stays
+    // part of the rule content, and the position we assign here can't be
+    // confused with it. ruleIdentity reads this property explicitly.
+    Object.defineProperty(compiled, "index", { value: index });
+    return compiled;
+  });
 }
 
 // Argument keys checked against a rule's path_prefix. Different tools
@@ -179,9 +207,80 @@ function pathMatches(rule, callArgs) {
 // /etc` matches a write to /etc/hosts but not one to ~/notes.md.
 function decide(toolName, callArgs) {
   const rule = compiledRules.find((r) => r.regex.test(toolName) && pathMatches(r, callArgs));
-  return rule
-    ? { action: rule.action, matchedRule: rule.path_prefix ? `${rule.tool} (path_prefix: ${rule.path_prefix})` : rule.tool }
-    : { action: "ask", matchedRule: "(no match, default)" };
+  if (!rule) return { action: "ask", matchedRule: "(no match, default)", rule: null };
+  const matchedRule = rule.path_prefix ? `${rule.tool} (path_prefix: ${rule.path_prefix})` : rule.tool;
+  return { action: rule.action, matchedRule, rule };
+}
+
+// Session grants. In memory only -- this Map is the whole store. Nothing
+// here is written to the audit log or anywhere else on disk, and the
+// entries die when the process does. There is no sweep timer: expired
+// entries are dropped the next time an ask decision looks one up.
+//
+// Key design: exact tool name + rule identity, not the call arguments.
+// A rule that matches on a path_prefix (or on a tool glob alone) already
+// says which arguments count as the same kind of call. Remembering the
+// rule means sandbox/a and sandbox/b don't each prompt, while a
+// write_file that matched a different rule (another prefix, or a deny)
+// still does. Keying on the raw arguments would barely cut down prompts
+// -- content and paths change every call -- and would hide the boundary
+// the policy author already drew.
+//
+// The tool name is the name in the tools/call, not the rule's glob, so
+// approving write_file under a write_* rule does not also approve
+// write_notes. On any doubt, the next call asks again.
+//
+// Rule identity is the rule's index plus its content (every own field
+// except the compiled regex). Index keeps two rules that would otherwise
+// stringify the same from sharing a grant; content keeps a grant from
+// surviving an edit that leaves the index in place. A missing or
+// unidentifiable rule does not match.
+const sessionGrants = new Map(); // key -> { expiresAt }
+
+function ruleIdentity(rule) {
+  if (!rule) return "implicit-default-ask";
+  if (typeof rule.index !== "number") return null;
+  const content = { "#index": rule.index };
+  for (const key of Object.keys(rule).filter((name) => name !== "regex").sort()) {
+    content[key] = rule[key];
+  }
+  return JSON.stringify(content);
+}
+
+function grantKey(toolName, rule) {
+  const identity = ruleIdentity(rule);
+  if (identity == null) return null;
+  return JSON.stringify([String(toolName), identity]);
+}
+
+function purgeExpiredGrants() {
+  const now = monotonicNow();
+  for (const [key, grant] of sessionGrants) {
+    if (!grant || typeof grant.expiresAt !== "number" || now >= grant.expiresAt) {
+      sessionGrants.delete(key);
+    }
+  }
+}
+
+// True only for an unexpired grant on this tool and this ask rule.
+// Deny (and allow) rules are not consulted. A key we can't build is
+// treated as "no grant" -- ask again rather than guess.
+function matchingSessionGrant(toolName, rule) {
+  if (!grantsEnabled()) return false;
+  if (rule && rule.action !== "ask") return false;
+  purgeExpiredGrants();
+  const key = grantKey(toolName, rule);
+  if (key == null) return false;
+  return sessionGrants.has(key);
+}
+
+function rememberSessionGrant(toolName, rule, matchedRule) {
+  if (!grantsEnabled()) return;
+  if (rule && rule.action !== "ask") return;
+  const key = grantKey(toolName, rule);
+  if (key == null) return;
+  sessionGrants.set(key, { expiresAt: monotonicNow() + grantTtlSeconds * 1000 });
+  console.error(`[GRANT] tool=${toolName} rule=${matchedRule} ttl=${grantTtlSeconds}s`);
 }
 
 const ASK_TIMEOUT_MS = 30000;
@@ -237,12 +336,17 @@ function nextElicitId() {
 // reply. The reply arrives back on process.stdin (client -> may-i), same
 // as any client request, and is intercepted in handleClientLine before
 // it would otherwise be forwarded to the child -- see there. Resolves to
-// "approved", "denied", "cancelled", "approved(tty-fallback)", or
-// "denied(tty-fallback)"; never rejects. An elicitation error or timeout
-// resolves to "denied". A tty fallback that throws, times out, or
-// returns anything other than "approved" resolves to
-// "denied(tty-fallback)". A failure here can never fail open into an
-// unapproved tools/call going through.
+// { outcome, remember } and never rejects. outcome is "approved",
+// "denied", "cancelled", "approved(tty-fallback)", or
+// "denied(tty-fallback)". remember is true only when the human picked
+// session scope (or tty `a`) and grants are enabled. An elicitation
+// error or timeout resolves to denied with remember false. A tty
+// fallback that throws, times out, or returns anything other than an
+// explicit approval resolves to "denied(tty-fallback)" with remember
+// false. A fast auto-decline is not itself an approval and cannot
+// remember anything -- only the fallback answer can, and only via `a`.
+// A failure here can never fail open into an unapproved tools/call
+// going through.
 //
 // callId is the client's tools/call id, used only if a too-fast
 // non-accept has to fall back to askHuman. The elicitation's own id
@@ -256,7 +360,7 @@ function askViaElicitation(callId, name, args) {
       settled = true;
       pendingElicitations.delete(id);
       console.error(`[ASK] id=${id} elicitation timed out after ${ASK_TIMEOUT_MS}ms, defaulting to deny`);
-      resolve("denied");
+      resolve({ outcome: "denied", remember: false });
     }, ASK_TIMEOUT_MS);
 
     // Stamp the send with a monotonic clock at dispatch, before the
@@ -264,30 +368,36 @@ function askViaElicitation(callId, name, args) {
     const sentAt = monotonicNow();
     pendingElicitations.set(id, {
       sentAt,
-      resolve(outcome) {
+      resolve(result) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         pendingElicitations.delete(id);
-        if (outcome && outcome.autoDeclined) {
+        if (result && result.autoDeclined) {
           console.error("[ASK] elicitation auto-declined by client (likely unsupported), falling back to terminal prompt");
-          // askHuman resolves "approved" or "denied", or rejects if
-          // something outside promptOnce throws. Anything other than an
-          // explicit approval -- including a throw, a timeout, or no
-          // tty -- is a deny. Never allow on an error.
+          // askHuman resolves "approved", "approved-remember", or
+          // "denied", or rejects if something outside promptOnce throws.
+          // Anything other than an explicit approval -- including a
+          // throw, a timeout, or no tty -- is a deny. Never allow on an
+          // error. Remember only when that approval was an explicit `a`.
           Promise.resolve()
             .then(() => askHuman(callId, name, args))
             .then(
-              (human) => resolve(human === "approved" ? "approved(tty-fallback)" : "denied(tty-fallback)"),
+              (human) => resolve(outcomeFromHuman(human, { fallback: true })),
               (err) => {
                 const detail = err && err.message ? err.message : err;
                 console.error(`[ASK] id=${callId} tty fallback failed (${detail}), defaulting to deny`);
-                resolve("denied(tty-fallback)");
+                resolve({ outcome: "denied(tty-fallback)", remember: false });
               }
             );
           return;
         }
-        resolve(outcome);
+        const outcome = result && typeof result.outcome === "string" ? result.outcome : "denied";
+        // Scope is ignored entirely when grants are disabled, even if a
+        // client sends session anyway. The call can still be approved
+        // once; it just isn't remembered.
+        const remember = !!(result && result.remember && grantsEnabled());
+        resolve({ outcome, remember });
       },
     });
 
@@ -297,22 +407,40 @@ function askViaElicitation(callId, name, args) {
       method: "elicitation/create",
       params: {
         mode: "form",
-        message: `may-i: approve tool call ${name}(${JSON.stringify(args)})?`,
-        requestedSchema: {
-          type: "object",
-          properties: {
-            approve: {
-              type: "string",
-              enum: ["approve", "deny"],
-              title: "Approve this tool call?",
-            },
-          },
-          required: ["approve"],
-        },
+        message: grantsEnabled()
+          ? `may-i: approve tool call ${name}(${JSON.stringify(args)})? You can approve just this call, or remember it for the rest of this may-i session.`
+          : `may-i: approve tool call ${name}(${JSON.stringify(args)})?`,
+        requestedSchema: elicitationSchema(),
       },
     };
     process.stdout.write(JSON.stringify(request) + "\n");
   });
+}
+
+// Two questions when grants are on: approve/deny, and whether to
+// remember. `once` is the default -- a missing scope does not remember.
+// When --grant-ttl is 0 the scope field is left out entirely, so the
+// form doesn't offer a choice that would be discarded.
+function elicitationSchema() {
+  const properties = {
+    approve: {
+      type: "string",
+      enum: ["approve", "deny"],
+      title: "Approve this tool call?",
+    },
+  };
+  const required = ["approve"];
+  if (grantsEnabled()) {
+    properties.scope = {
+      type: "string",
+      enum: ["once", "session"],
+      title: "Remember this approval?",
+      description: "once (default): this call only. session: remember this tool and rule until may-i exits or the grant expires.",
+      default: "once",
+    };
+    required.push("scope");
+  }
+  return { type: "object", properties, required };
 }
 
 // True when a decline or cancel arrived too fast to be a person
@@ -327,6 +455,8 @@ function isFastAutoDecline(pending) {
 // Handles a reply on process.stdin matching one of may-i's own
 // outstanding elicitation ids. Maps the client's response to an outcome:
 //   action "accept" + content.approve === "approve" -> "approved"
+//      (+ remember when content.scope === "session"; anything else,
+//       including a missing scope, is once)
 //   action "accept" + content.approve === "deny"     -> "denied"
 //   action "decline"                                 -> "denied"
 //      (or { autoDeclined } if it arrived under the threshold)
@@ -335,30 +465,72 @@ function isFastAutoDecline(pending) {
 //   anything else (malformed, error response, unexpected content) -> "denied"
 // Never resolves to "approved" except on an explicit accept+approve --
 // every other shape of reply denies, so a malformed or unexpected
-// response can't accidentally let a call through. The accept branch is
+// response can't accidentally let a call through. remember is set only
+// on that same explicit approval, and only for the exact scope string
+// "session". A decline or cancel never remembers, however fast it was
+// and whatever else the payload contains. The accept branch is
 // intentionally not timed: a fast explicit approval is still an approval.
 function handleElicitResponse(msg) {
   const pending = pendingElicitations.get(msg.id);
   if (!pending) return; // not one of ours (shouldn't happen -- caller checks first)
 
   if (msg.error) {
-    pending.resolve("denied");
+    pending.resolve({ outcome: "denied", remember: false });
     return;
   }
   const action = msg.result?.action;
   if (action === "cancel") {
-    pending.resolve(isFastAutoDecline(pending) ? { autoDeclined: true } : "cancelled");
+    pending.resolve(isFastAutoDecline(pending) ? { autoDeclined: true } : { outcome: "cancelled", remember: false });
   } else if (action === "accept" && msg.result?.content?.approve === "approve") {
-    pending.resolve("approved");
+    const remember = msg.result.content.scope === "session";
+    pending.resolve({ outcome: "approved", remember });
   } else if (action === "decline" && isFastAutoDecline(pending)) {
     pending.resolve({ autoDeclined: true });
   } else {
-    // slow decline, or accept with any other content -- both deny
-    pending.resolve("denied");
+    // slow decline, or accept with any other content -- both deny, and
+    // neither remembers. A scope field on a denial is ignored.
+    pending.resolve({ outcome: "denied", remember: false });
   }
 }
 
-// Opens /dev/tty and asks one y/n question, then closes it immediately.
+// Maps a tty answer (already classified) onto the verdict outcome.
+// fallback true is the elicitation auto-decline path: any non-approval
+// collapses to denied(tty-fallback), matching the pre-grant behavior.
+// The direct tty path (no elicitation support) keeps the raw non-approval
+// string so a stub that returns "denied" still audits as ask→denied.
+// `a` remembers only when grants are enabled; with --grant-ttl 0 the
+// classifier never returns approved-remember, and this function would
+// drop the flag anyway.
+function outcomeFromHuman(human, { fallback }) {
+  if (human === "approved" || human === "approved-remember") {
+    const outcome = fallback ? "approved(tty-fallback)" : "approved";
+    return { outcome, remember: human === "approved-remember" && grantsEnabled() };
+  }
+  if (fallback) return { outcome: "denied(tty-fallback)", remember: false };
+  const outcome = typeof human === "string" && human ? human : "denied";
+  return { outcome, remember: false };
+}
+
+function formatTtyPrompt(id, name, args) {
+  const choices = grantsEnabled()
+    ? "y/n/a, a = approve and remember for this session"
+    : "y/n";
+  return `[ASK] id=${id} tool=${name} args=${JSON.stringify(args)}. Approve? (${choices}): `;
+}
+
+// y approves once. a approves and remembers, and only when grants are
+// enabled -- otherwise the letter isn't offered, and it falls through
+// to deny like any other non-y answer. n and everything else deny.
+// Case and surrounding whitespace don't matter.
+function classifyTtyAnswer(answer) {
+  const normalized = String(answer ?? "").trim().toLowerCase();
+  if (normalized === "y") return "approved";
+  if (normalized === "a" && grantsEnabled()) return "approved-remember";
+  return "denied";
+}
+
+// Opens /dev/tty and asks one y/n/a question (y/n when grants are off),
+// then closes it immediately.
 // /dev/tty is deliberately NOT held open between prompts: on macOS (and
 // most Unixes) it resolves to the same underlying terminal device as
 // process.stdin when stdin is a tty. Two independent readers on that
@@ -381,6 +553,15 @@ function handleElicitResponse(msg) {
 // finish(), same as the read side alone was before -- this doubles the
 // fds involved but not the duration either is held open for.
 function promptOnce(id, name, args) {
+  // Test hook: same classifier as the real prompt, without opening
+  // /dev/tty. An explicit `a` is the only tty answer that remembers.
+  if (ttyAnswerOverride !== null && ttyAnswerOverride !== undefined) {
+    const answer = typeof ttyAnswerOverride === "function"
+      ? ttyAnswerOverride(id, name, args)
+      : ttyAnswerOverride;
+    return Promise.resolve(classifyTtyAnswer(answer));
+  }
+
   return new Promise((resolve) => {
     let settled = false;
     let ttyIn, ttyOut, rl;
@@ -415,8 +596,8 @@ function promptOnce(id, name, args) {
       if (!inReady || !outReady || settled) return;
       rl = createInterface({ input: ttyIn, output: ttyOut });
       rl.question(
-        `[ASK] id=${id} tool=${name} args=${JSON.stringify(args)}. Approve? (y/n): `,
-        (answer) => finish(answer.trim().toLowerCase() === "y" ? "approved" : "denied")
+        formatTtyPrompt(id, name, args),
+        (answer) => finish(classifyTtyAnswer(answer))
       );
     }
 
@@ -499,22 +680,37 @@ async function handleClientLine(line) {
   const { name, arguments: args } = msg.params ?? {};
   console.error(`[INSPECT] id=${msg.id} tool=${name} args=${JSON.stringify(args)}`);
 
-  const { action, matchedRule } = decide(name, args);
+  const { action, matchedRule, rule } = decide(name, args);
   let decision = action;
   let verdictLabel = action;
 
   if (action === "ask") {
-    // "approved" | "denied" | "cancelled" from elicitation, or
-    // "approved" | "denied" from the tty path. A too-fast decline or
-    // cancel comes back as "approved(tty-fallback)" or
-    // "denied(tty-fallback)" after askHuman runs. Only an explicit
-    // approval allows the call; the fallback forms are explicit too,
-    // and every error shape stays a deny.
-    const outcome = (elicitationSupport.form || elicitationSupport.url)
-      ? await askViaElicitation(msg.id, name, args)
-      : await askHuman(msg.id, name, args);
-    decision = outcome === "approved" || outcome === "approved(tty-fallback)" ? "allow" : "deny";
-    verdictLabel = `ask→${outcome}`;
+    // A remembered approval applies only while the rule that matches
+    // NOW is still an ask. A deny rule never enters this branch, so a
+    // grant cannot turn a denied call into an allow, including after
+    // the policy is recompiled and a different rule matches. The audit
+    // label stays ask→granted(session) so it can't be read as a plain
+    // policy allow.
+    if (matchingSessionGrant(name, rule)) {
+      decision = "allow";
+      verdictLabel = "ask→granted(session)";
+    } else {
+      // "approved" | "denied" | "cancelled" from elicitation, or
+      // "approved" | "denied" from the tty path. A too-fast decline or
+      // cancel comes back as "approved(tty-fallback)" or
+      // "denied(tty-fallback)" after askHuman runs. Only an explicit
+      // approval allows the call; the fallback forms are explicit too,
+      // and every error shape stays a deny. remember is a separate
+      // flag: the creating call is still an approval, and only later
+      // calls log ask→granted(session).
+      const { outcome, remember } = (elicitationSupport.form || elicitationSupport.url)
+        ? await askViaElicitation(msg.id, name, args)
+        : outcomeFromHuman(await askHuman(msg.id, name, args), { fallback: false });
+      const approved = outcome === "approved" || outcome === "approved(tty-fallback)";
+      decision = approved ? "allow" : "deny";
+      verdictLabel = `ask→${outcome}`;
+      if (approved && remember) rememberSessionGrant(name, rule, matchedRule);
+    }
   }
 
   console.error(`[VERDICT] id=${msg.id} tool=${name} decision=${verdictLabel}`);
@@ -558,6 +754,11 @@ function main() {
   if (elicitFlagIndex !== -1) {
     elicitAutoDeclineMs = parseNonNegativeInt(beforeSep[elicitFlagIndex + 1], "--elicit-autodecline-ms");
   }
+  const grantFlagIndex = beforeSep.indexOf("--grant-ttl");
+  if (grantFlagIndex !== -1) {
+    grantTtlSeconds = parseNonNegativeInt(beforeSep[grantFlagIndex + 1], "--grant-ttl");
+  }
+  sessionGrants.clear();
   const [command, ...args] = process.argv.slice(sepIndex + 1);
 
   // Zero-config fallback: if no --policy was given and there's no
@@ -587,6 +788,7 @@ function main() {
   console.error(`[CONFIG] policy: ${policySource}`);
   console.error(`[CONFIG] audit mode: ${auditIncludeArgs ? "decisions + args" : "decisions only"}`);
   console.error(`[CONFIG] elicit auto-decline: ${elicitAutoDeclineMs === 0 ? "off" : elicitAutoDeclineMs + "ms"}`);
+  console.error(`[CONFIG] session grants: ${grantsEnabled() ? grantTtlSeconds + "s" : "off"}`);
 
   child = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });
 
@@ -657,21 +859,27 @@ export function configureForTest({
   auditFile,
   includeArgs = false,
   autoDeclineMs = 250,
+  grantTtlSeconds: grantTtl = DEFAULT_GRANT_TTL_SECONDS,
   childStdin,
   askHuman: askHumanFn = null,
+  ttyAnswer = null,
   now = null,
+  resetGrants = true,
 }) {
   policy = { rules };
   compileRules(rules);
   auditPath = auditFile;
   auditIncludeArgs = includeArgs;
   elicitAutoDeclineMs = autoDeclineMs;
+  grantTtlSeconds = grantTtl;
   elicitationSupport = { form: false, url: false };
   pendingElicitations.clear();
   elicitCounter = 0;
   askQueue = Promise.resolve();
   askHumanOverride = askHumanFn;
+  ttyAnswerOverride = ttyAnswer;
   clockOverride = now;
+  if (resetGrants) sessionGrants.clear();
   child = { stdin: childStdin };
 }
 
@@ -692,6 +900,6 @@ function isDirectRun() {
   }
 }
 
-export { handleClientLine };
+export { handleClientLine, formatTtyPrompt, classifyTtyAnswer };
 
 if (isDirectRun()) main();

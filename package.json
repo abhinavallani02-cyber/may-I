@@ -13,7 +13,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test-elicit-fallback.mjs"
+    "test": "node test-elicit-fallback.mjs && node test-grants.mjs"
   },
   "keywords": [
     "mcp",
