@@ -8,6 +8,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { parse as parseYaml } from "yaml";
 import { classifyTtyAnswer, configureForTest, formatTtyPrompt, handleClientLine } from "./mayi.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "mayi-grants-"));
@@ -192,6 +193,14 @@ function expectVerdict(h, { id, tool, verdict, forwarded }) {
   assert(h.forwarded(id).length === (forwarded ? 1 : 0), `id ${id} forwarded ${h.forwarded(id).length}, expected ${forwarded ? 1 : 0}`);
   assert(h.blocked(id) === !forwarded, `id ${id} blocked=${h.blocked(id)}`);
 }
+
+// The same file --rules filesystem loads, prepended the way main()
+// prepends a pack before --policy. notes is not in that pack, so it
+// falls through to the policy rule, but the compiled index changes.
+const filesystemPack = parseYaml(
+  readFileSync(new URL("./rules/filesystem.yaml", import.meta.url), "utf8"),
+).rules;
+const notesAsk = { tool: "notes", action: "ask" };
 
 const sessionReply = { action: "accept", content: { approve: "approve", scope: "session" } };
 const onceReply = { action: "accept", content: { approve: "approve", scope: "once" } };
@@ -531,6 +540,103 @@ await check("an allow rule stays allow", async (h) => {
   const read = await h.call({ id: 8, name: "read_file", args: { path: "a.txt" } });
   assert(!read.elicited, "allow does not ask");
   expectVerdict(h, { id: 8, tool: "read_file", verdict: "allow", forwarded: true });
+});
+
+await check("a session grant does not cover a structurally blocked allow", async (h) => {
+  await h.start({
+    rules: [
+      { tool: "query", sql: { single: "select" }, action: "allow" },
+      { tool: "query", action: "ask" },
+      { tool: "write_file", path_prefix: "/tmp", action: "allow" },
+      { tool: "write_file", action: "ask" },
+    ],
+  });
+
+  // A single INSERT misses the select allow and does not block later
+  // rules, so the ask rule can be remembered.
+  await h.call({ id: 7, name: "query", args: { sql: "INSERT INTO t VALUES (1)" }, reply: sessionReply });
+  expectVerdict(h, { id: 7, tool: "query", verdict: "ask→approved", forwarded: true });
+  assert(h.grantLogs().length === 1, "the ask rule was remembered");
+
+  const compound = await h.call({
+    id: 8,
+    name: "query",
+    args: { sql: "SELECT 1; DROP TABLE users" },
+    reply: denyReply,
+  });
+  assert(compound.elicited, "a grant must not cover a call whose allow was structurally blocked");
+  expectVerdict(h, { id: 8, tool: "query", verdict: "ask→denied(blocked-allow)", forwarded: false });
+
+  // Approving that blocked call, even with session scope, must not
+  // store a grant. The next compound statement still asks.
+  const approved = await h.call({ id: 9, name: "query", args: { sql: "SELECT '" }, reply: sessionReply });
+  assert(approved.elicited, "unparseable SQL still asks");
+  expectVerdict(h, { id: 9, tool: "query", verdict: "ask→approved(blocked-allow)", forwarded: true });
+  const again = await h.call({
+    id: 10,
+    name: "query",
+    args: { sql: "SELECT 1; DELETE FROM t" },
+    reply: denyReply,
+  });
+  assert(again.elicited, "approving a blocked call must not create a grant");
+  expectVerdict(h, { id: 10, tool: "query", verdict: "ask→denied(blocked-allow)", forwarded: false });
+  assert(h.grantLogs().length === 1, "blocked approvals must not log [GRANT]");
+
+  // The original grant still covers an ask that did not block an allow.
+  const plain = await h.call({ id: 11, name: "query", args: { sql: "INSERT INTO t VALUES (2)" } });
+  assert(!plain.elicited, "the ask-rule grant still applies when nothing was blocked");
+  expectVerdict(h, { id: 11, tool: "query", verdict: "ask→granted(session)", forwarded: true });
+
+  // Same shape for a path that cannot be resolved: the allow is
+  // blocked, so the later ask grant does not apply and is not extended.
+  await h.call({ id: 12, name: "write_file", args: { path: "sandbox/a.txt" }, reply: sessionReply });
+  const uncertain = await h.call({
+    id: 13,
+    name: "write_file",
+    args: { path: "/tmp/a\0b" },
+    reply: denyReply,
+  });
+  assert(uncertain.elicited, "a null byte must not ride an ask grant");
+  expectVerdict(h, { id: 13, tool: "write_file", verdict: "ask→denied(blocked-allow)", forwarded: false });
+  const outside = await h.call({ id: 14, name: "write_file", args: { path: "sandbox/b.txt" } });
+  assert(!outside.elicited, "a resolvable path outside the allow prefix still uses the grant");
+  expectVerdict(h, { id: 14, tool: "write_file", verdict: "ask→granted(session)", forwarded: true });
+});
+
+await check("pack rule order is part of the grant key", async (h) => {
+  const packed = [...filesystemPack, notesAsk];
+  await h.start({ rules: packed });
+
+  const read = await h.call({ id: 7, name: "read_file", args: { path: "/tmp/a.txt" } });
+  assert(!read.elicited, "a pack allow is not an ask");
+  expectVerdict(h, { id: 7, tool: "read_file", verdict: "allow", forwarded: true });
+
+  await h.call({ id: 8, name: "notes", args: { text: "a" }, reply: sessionReply });
+  assert(
+    h.grantLogs()[0] === "[GRANT] tool=notes rule=notes ttl=1800s",
+    `GRANT line ${h.grantLogs()[0]}`,
+  );
+  const again = await h.call({ id: 9, name: "notes", args: { text: "b" } });
+  assert(!again.elicited, "the pack-first identity is what the grant stores");
+  expectVerdict(h, { id: 9, tool: "notes", verdict: "ask→granted(session)", forwarded: true });
+
+  // Same rule text, index 0 instead of the index after the pack.
+  await h.reload({ rules: [notesAsk], elicitation: true });
+  const unpacked = await h.call({ id: 10, name: "notes", args: { text: "c" }, reply: onceReply });
+  assert(unpacked.elicited, "dropping the pack changes the rule identity");
+  expectVerdict(h, { id: 10, tool: "notes", verdict: "ask→approved", forwarded: true });
+});
+
+await check("a grant recorded without a pack does not cover the pack-first rule", async (h) => {
+  await h.start({ rules: [notesAsk] });
+  await h.call({ id: 7, name: "notes", args: { text: "a" }, reply: sessionReply });
+  expectVerdict(h, { id: 7, tool: "notes", verdict: "ask→approved", forwarded: true });
+
+  await h.reload({ rules: [...filesystemPack, notesAsk], elicitation: true });
+  const shifted = await h.call({ id: 8, name: "notes", args: { text: "b" }, reply: onceReply });
+  assert(shifted.elicited, "--rules shifts the policy rule's index, so the old grant must not apply");
+  expectVerdict(h, { id: 8, tool: "notes", verdict: "ask→approved", forwarded: true });
+  assert(h.grantLogs().length === 1, "once scope must not add a second grant");
 });
 
 await check("a denial does not remember even with scope session", async (h) => {
