@@ -20,10 +20,11 @@ server, to enforce them itself.
 
 Early and small. It has only been tested against one server
 (`@modelcontextprotocol/server-filesystem`) over stdio, which is currently
-the only transport it supports — no HTTP or SSE. Policy matching is tool
-name (with glob support) plus an optional path-prefix check on arguments;
-there's no general condition language yet. It has not had a security
-review. Treat it as a working prototype, not a hardened boundary.
+the only transport it supports — no HTTP or SSE. Policy matching is a
+tool-name glob, then a structural check only when a rule asks for one:
+a canonical `path_prefix`, or `sql.single` for one SQL statement of a
+named type. There is no general condition language yet. It has not had a
+security review. Treat it as a working prototype, not a hardened boundary.
 
 **`ask` verdicts prefer MCP elicitation, with `/dev/tty` as fallback.** If
 the connected client declares the `elicitation` capability at
@@ -151,9 +152,9 @@ node mayi.mjs -- npx -y @modelcontextprotocol/server-filesystem /path/to/allow
 ## Policy
 
 A policy file is a list of rules, checked in order — the first matching
-rule wins. Each rule matches on the tool name (supporting `*` as a glob)
-and, optionally, a `path_prefix` checked against the call's `path`,
-`source`, or `destination` argument, whichever is present.
+rule wins. The tool name is a glob (`*` matches any run of characters)
+and is always the first check. Structural checks run only after that
+glob matches, and only when the rule declares them.
 
 ```yaml
 rules:
@@ -164,12 +165,88 @@ rules:
     path_prefix: /etc
     action: deny
 
+  - tool: query
+    sql:
+      single: select
+    action: allow
+
+  - tool: query
+    action: deny
+
   - tool: write_*
     action: ask
 
   - tool: "*"
-    action: allow
+    action: ask
 ```
+
+`path_prefix` is checked against `path`, `source`, and `destination`.
+The value is canonicalized before the comparison, so `..`, `.`, and
+duplicate slashes cannot walk out of it: `path_prefix: /prod` matches
+`/prod`, `/prod/db`, `/prod/../prod/db`, `/prod//db`, and `/prod/./db`.
+The match is on path segments, so `/prod` does not match `/production`
+or `/prod-backup`.
+
+Symlinks: if the path exists, may-i uses `realpath`. If it does not,
+may-i `realpath`s the longest existing ancestor and appends the rest
+lexically, so a file that is not created yet still counts as living in
+the directory a symlink points at. If no ancestor exists, the check
+stays lexical. A deny or ask rule matches when either the path as
+written or that resolved path is inside the prefix, which is how a
+symlink into `/etc` still hits a `/etc` deny. An allow rule matches
+only when every present path argument resolves inside the prefix, so
+`source` inside `/safe` and `destination` outside it does not match an
+allow for `/safe`. The prefix itself is `realpath`'d when that path
+exists, so a rule written against a symlink and a call written against
+its target see the same directory. Relative paths and relative prefixes
+are resolved against the process's current directory. If resolution
+fails for another reason (permissions, a symlink loop, a null byte, or
+a path argument that is not a string), the allow rule does not match
+and later allow rules are skipped for that call.
+
+`sql.single` asks for exactly one statement whose leading verb is the
+given name, or one of a list (`single: [select, with]`). The verb match
+is case-insensitive. The text is read from `sql`, `query`, or
+`statement` (every one of those that is present has to satisfy the
+rule). Quotes, `--` and `/* */` comments, and PostgreSQL dollar quotes
+are recognized, so a semicolon inside them does not start another
+statement:
+
+```sql
+SELECT 1; DROP TABLE users                         -- two statements, no match
+SELECT 1; /* hidden */ DROP TABLE users            -- two statements, no match
+SELECT 1 -- comment
+; DROP TABLE users                                 -- two statements, no match
+SELECT 'text; still text';                         -- one SELECT
+SELECT 1 /* ; DROP TABLE users */;                 -- one SELECT
+SELECT $$ ; still the same statement $$;           -- one SELECT
+```
+
+A compound statement does not match `sql.single`. An unparseable one
+does not either: an unclosed quote, an unclosed comment, an unclosed
+dollar quote, no statement at all, or a null byte. In both cases the
+allow rule does not match, and no later allow rule can match that call
+either. The call falls through to a later deny or ask, or to the
+default ask. It is never allowed by a rule that asked for a single
+safe statement. A later rule with no `sql` key can still allow a
+*different*, well-formed single statement (an `insert` allow placed
+after a `select` allow). It cannot allow `SELECT 1; DROP TABLE users`.
+
+This is a statement splitter, not a full SQL parser, and it does not
+send the statement anywhere. It does not understand statement bodies.
+`SELECT ... INTO`, `COPY`, and a function that writes can still match
+`single: select`. `EXPLAIN DELETE` is an `explain`, not a `delete`.
+`WITH ... SELECT` and `WITH ... DELETE` are both `with`; allowing
+`with` does not look at the statement after the CTE. List `with` only
+when that is acceptable.
+MySQL `#` comments are not comments here; a semicolon after `#` looks
+like another statement and the allow does not match. Backslash escapes
+inside quotes are not honored, so some MySQL strings look unparseable
+and fail closed rather than matching.
+
+A structural miss is not a new verdict. The audit label is still `allow`,
+`deny`, or an `ask→…` outcome from the rule that matched, or from the
+default ask. Nothing in this check fails open into an allow.
 
 The three actions:
 

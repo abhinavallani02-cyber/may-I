@@ -34,6 +34,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { parse as parseYaml } from "yaml";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { compileStructural, evaluateStructural } from "./structural.mjs";
 
 const HELP_TEXT = `mayi -- an MCP proxy that enforces allow/deny/ask policy on tool calls
 
@@ -179,43 +180,69 @@ function globToRegex(glob) {
 }
 let compiledRules = [];
 function compileRules(rules) {
-  compiledRules = rules.map((rule, index) => {
-    const compiled = { ...rule, regex: globToRegex(rule.tool) };
+  if (!Array.isArray(rules)) {
+    throw new Error('policy must have a top-level "rules" list');
+  }
+  // Build the whole list before publishing it, so a bad rule doesn't
+  // leave a half-compiled policy in place for the next call.
+  const compiled = rules.map((rule, index) => {
+    const where = `policy rule ${index + 1}`;
+    if (!rule || typeof rule !== "object" || Array.isArray(rule)) {
+      throw new Error(`${where} must be a mapping`);
+    }
+    if (typeof rule.tool !== "string" || rule.tool.length === 0) {
+      throw new Error(`${where} needs a string tool name`);
+    }
+    if (rule.action !== "allow" && rule.action !== "deny" && rule.action !== "ask") {
+      throw new Error(`${where} action must be allow, deny, or ask`);
+    }
+    const structural = compileStructural(rule, index);
+    const compiledRule = { ...rule, regex: globToRegex(rule.tool), ...structural };
     // Non-enumerable so a hand-written `index:` field in the YAML stays
     // part of the rule content, and the position we assign here can't be
     // confused with it. ruleIdentity reads this property explicitly.
-    Object.defineProperty(compiled, "index", { value: index });
-    return compiled;
+    // The index is the position in the compiled list, including pack
+    // rules that were placed in front of --policy.
+    Object.defineProperty(compiledRule, "index", { value: index });
+    return compiledRule;
   });
+  compiledRules = compiled;
 }
 
-// Argument keys checked against a rule's path_prefix. Different tools
-// use different names for "the path this call touches" -- read/write
-// tools use `path`, move/rename tools use `source`/`destination`. A
-// rule matches if ANY of these keys is present and starts with the
-// prefix, so one rule can cover write_file and move_file alike.
-const PATH_ARG_KEYS = ["path", "source", "destination"];
-
-// True if this rule has no path_prefix (always matches on that axis),
-// or if at least one path-bearing argument starts with it.
-function pathMatches(rule, callArgs) {
-  if (!rule.path_prefix) return true;
-  if (!callArgs) return false;
-  return PATH_ARG_KEYS.some(
-    (key) => typeof callArgs[key] === "string" && callArgs[key].startsWith(rule.path_prefix)
-  );
+function ruleLabel(rule) {
+  const notes = [];
+  if (rule.hasPath) notes.push(`path_prefix: ${rule.path_prefix}`);
+  if (rule.hasSql) notes.push(`sql.single: ${rule.sqlSingle.join("|")}`);
+  return notes.length === 0 ? rule.tool : `${rule.tool} (${notes.join(", ")})`;
 }
 
-// First matching rule wins; a policy file is expected to end with a
-// catch-all ("*") rule, but if it doesn't, unmatched calls default to
-// ask. A rule with a path_prefix only matches calls whose path-bearing
-// argument starts with that prefix -- e.g. `tool: write_*, path_prefix:
-// /etc` matches a write to /etc/hosts but not one to ~/notes.md.
-function decide(toolName, callArgs) {
-  const rule = compiledRules.find((r) => r.regex.test(toolName) && pathMatches(r, callArgs));
-  if (!rule) return { action: "ask", matchedRule: "(no match, default)", rule: null };
-  const matchedRule = rule.path_prefix ? `${rule.tool} (path_prefix: ${rule.path_prefix})` : rule.tool;
-  return { action: rule.action, matchedRule, rule };
+// Glob first. Structural checks (canonical path_prefix, sql.single)
+// run only for a rule that declares them, and only after the tool name
+// matches. First match wins. A compound or unparseable SQL statement,
+// or a path that cannot be resolved, does not match an allow rule and
+// suppresses later allow rules for this call, so the result is a later
+// deny or ask, or the default ask. Never an allow from that failure.
+// `rule` is the compiled rule object so a session grant can key on its
+// identity. The default ask has no rule.
+export function decide(toolName, callArgs) {
+  let blockAllows = false;
+  const cache = { paths: new Map(), prefixes: new Map() };
+  for (const rule of compiledRules) {
+    if (typeof toolName !== "string" || !rule.regex.test(toolName)) continue;
+    if (blockAllows && rule.action === "allow") continue;
+    const outcome = (rule.hasPath || rule.hasSql)
+      ? evaluateStructural(rule, callArgs, cache)
+      : { match: true, blockLaterAllows: false };
+    if (outcome.blockLaterAllows) blockAllows = true;
+    if (!outcome.match) continue;
+    return { action: rule.action, matchedRule: ruleLabel(rule), blockedAllow: blockAllows, rule };
+  }
+  return {
+    action: "ask",
+    matchedRule: blockAllows ? "(structural reject, default ask)" : "(no match, default)",
+    blockedAllow: blockAllows,
+    rule: null,
+  };
 }
 
 // Session grants. In memory only -- this Map is the whole store. Nothing
@@ -789,7 +816,12 @@ function main() {
     policy = BUILTIN_DEFAULT_POLICY;
     policySource = "built-in default (reads allowed, everything else asks)";
   }
-  compileRules(policy.rules);
+  try {
+    compileRules(policy.rules);
+  } catch (err) {
+    console.error(`mayi: ${err.message}`);
+    process.exit(1);
+  }
 
   console.error(`[CONFIG] policy: ${policySource}`);
   console.error(`[CONFIG] audit mode: ${auditIncludeArgs ? "decisions + args" : "decisions only"}`);
