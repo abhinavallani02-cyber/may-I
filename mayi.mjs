@@ -54,7 +54,7 @@ Options:
                         A decline or cancel faster than <n> milliseconds
                          is treated as the client auto-declining (no UI)
                          and falls back to the /dev/tty prompt. Default
-                         250. 0 disables it.
+                         750. 0 disables it.
   --grant-ttl <seconds>
                         How long an approval remembered for this session
                          stays in effect. Default 1800 (30 minutes).
@@ -70,7 +70,13 @@ Example:
 // fails closed if anything asks early.
 let auditPath = "audit.jsonl";
 let auditIncludeArgs = false;
-let elicitAutoDeclineMs = 250;
+// 750ms is above the ~400ms headless Claude Code auto-decline reported
+// on anthropics/claude-code#79174 (koshak01, rmcp 3.1.2, Claude Code
+// v2.1.227) and below the 1.8s human click may-i measured in Cursor
+// (inspect to verdict ask→approved). The earlier 250ms default was a
+// guess and would miss that ~400ms decline. A Claude Code CLI
+// auto-decline has not been timed here. See the README.
+let elicitAutoDeclineMs = 750;
 // How long a remembered approval stays in effect, in seconds. 0 turns
 // session grants off entirely (the remember option is not offered, and
 // a scope/answer that asks to remember is ignored).
@@ -858,7 +864,7 @@ export function configureForTest({
   rules,
   auditFile,
   includeArgs = false,
-  autoDeclineMs = 250,
+  autoDeclineMs = 750,
   grantTtlSeconds: grantTtl = DEFAULT_GRANT_TTL_SECONDS,
   childStdin,
   askHuman: askHumanFn = null,

@@ -48,11 +48,33 @@ non-interactive ("print mode") specifically for the elicitation path,
 even though the same session correctly renders other interactive prompts
 (permission dialogs, `AskUserQuestion`). Until that's fixed upstream,
 may-i treats a `decline` or `cancel` that arrives faster than a person
-could plausibly have answered (under 250ms by default, see
+could plausibly have answered (under 750ms by default, see
 `--elicit-autodecline-ms`) as "the client cannot ask" rather than "the
 user said no", and falls back to the `/dev/tty` prompt. A non-accept at
 or after that threshold is still a real decision. The fallback fails
 closed: no terminal, a timeout, or an error denies the call.
+
+The first default, 250ms, was a guess. It is too low for the one
+auto-decline that has actually been reported. The default is now 750ms,
+set from these two data points:
+
+- **~400ms — reported by koshak01, not measured by may-i.** On
+  [anthropics/claude-code#79174](https://github.com/anthropics/claude-code/issues/79174)
+  (comment, 2026-08-11), a headless Claude Code v2.1.227 session
+  auto-declined every `elicitation/create` from their Rust MCP server
+  (`rmcp` 3.1.2) about 400ms later, with no user interaction. The
+  comment says "~400ms". may-i has not reproduced that number.
+- **1.8s — measured by may-i.** A real human click in Cursor, timed
+  from inspect to the audit verdict `ask→approved`, took 1.8s.
+
+750ms is above that reported ~400ms decline and clear of the 1.8s
+click, so the known fast decline still falls back to the terminal and
+a person's answer stays a real decision. Still unmeasured: an elicitation
+auto-decline from the Claude Code CLI, and one from the VS Code
+extension itself. The extension cannot be run in the environment where
+this default was set, and no authenticated Claude Code CLI was
+available there to time. The ~400ms figure remains koshak01's report
+of a headless session.
 
 ## Install
 
@@ -108,8 +130,9 @@ Flags:
   comes back in less than `<n>` milliseconds, treat it as the client
   auto-declining without showing UI (the Claude Code bug above) and fall
   back to the `/dev/tty` prompt instead of recording a user denial.
-  Default `250`. `0` disables the heuristic, so every non-accept is a
-  real decision. Must be a non-negative integer.
+  Default `750`. `0` disables the heuristic, so every non-accept is a
+  real decision. Must be a non-negative integer. The [Status](#status)
+  section records why 750ms replaced the earlier 250ms guess.
 - `--grant-ttl <seconds>` — how long a remembered approval stays in
   effect. Default `1800` (30 minutes). `0` disables session grants, so
   every `ask` asks and the remember option is not offered. Must be a

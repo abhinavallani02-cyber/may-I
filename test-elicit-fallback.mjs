@@ -157,55 +157,76 @@ const acceptDeny = { action: "accept", content: { approve: "deny" } };
 
 await check(
   "fast decline falls back and uses askHuman approval",
-  { threshold: 250, useRealClock: true, result: decline, askResult: "approved" },
+  { threshold: 750, useRealClock: true, result: decline, askResult: "approved" },
   { verdict: "ask→approved(tty-fallback)", fallback: true, asked: true, forwarded: true },
 );
 
 await check(
   "fast decline falls back and uses askHuman denial",
-  { threshold: 250, elapsedMs: 0, result: decline, askResult: "denied" },
+  { threshold: 750, elapsedMs: 0, result: decline, askResult: "denied" },
   { verdict: "ask→denied(tty-fallback)", fallback: true, asked: true, forwarded: false },
 );
 
 await check(
   "fast decline askHuman throw fails closed",
-  { threshold: 250, elapsedMs: 1, result: decline, askThrows: new Error("no tty") },
+  { threshold: 750, elapsedMs: 1, result: decline, askThrows: new Error("no tty") },
   { verdict: "ask→denied(tty-fallback)", fallback: true, asked: true, forwarded: false },
 );
 
 await check(
   "fast cancel falls back the same way",
-  { threshold: 250, elapsedMs: 0, result: cancel, askResult: "approved" },
+  { threshold: 750, elapsedMs: 0, result: cancel, askResult: "approved" },
   { verdict: "ask→approved(tty-fallback)", fallback: true, asked: true, forwarded: true },
 );
 
 await check(
   "decline at the threshold is a user deny",
-  { threshold: 250, elapsedMs: 250, result: decline, askResult: "approved" },
+  { threshold: 750, elapsedMs: 750, result: decline, askResult: "approved" },
   { verdict: "ask→denied", fallback: false, asked: false, forwarded: false },
 );
 
 await check(
   "slow decline is a user deny",
-  { threshold: 250, elapsedMs: 5000, result: decline, askResult: "approved" },
+  { threshold: 750, elapsedMs: 5000, result: decline, askResult: "approved" },
+  { verdict: "ask→denied", fallback: false, asked: false, forwarded: false },
+);
+
+// The reported headless auto-decline is ~400ms (claude-code#79174).
+// 750ms catches it. The old 250ms guess does not. A decline at the
+// measured 1.8s human click stays a real user decision.
+await check(
+  "reported ~400ms decline falls back at the 750ms default",
+  { threshold: 750, elapsedMs: 400, result: decline, askResult: "approved" },
+  { verdict: "ask→approved(tty-fallback)", fallback: true, asked: true, forwarded: true },
+);
+
+await check(
+  "a 250ms threshold misses the reported ~400ms decline",
+  { threshold: 250, elapsedMs: 400, result: decline, askResult: "approved" },
+  { verdict: "ask→denied", fallback: false, asked: false, forwarded: false },
+);
+
+await check(
+  "decline at the measured 1.8s human click is a user deny",
+  { threshold: 750, elapsedMs: 1800, result: decline, askResult: "approved" },
   { verdict: "ask→denied", fallback: false, asked: false, forwarded: false },
 );
 
 await check(
   "slow cancel stays cancelled",
-  { threshold: 250, elapsedMs: 250, result: cancel, askResult: "approved" },
+  { threshold: 750, elapsedMs: 750, result: cancel, askResult: "approved" },
   { verdict: "ask→cancelled", fallback: false, asked: false, forwarded: false },
 );
 
 await check(
   "accept is unchanged even when instant",
-  { threshold: 250, elapsedMs: 0, result: accept, askResult: "denied" },
+  { threshold: 750, elapsedMs: 0, result: accept, askResult: "denied" },
   { verdict: "ask→approved", fallback: false, asked: false, forwarded: true },
 );
 
 await check(
   "accept with a deny answer stays denied",
-  { threshold: 250, elapsedMs: 0, result: acceptDeny, askResult: "approved" },
+  { threshold: 750, elapsedMs: 0, result: acceptDeny, askResult: "approved" },
   { verdict: "ask→denied", fallback: false, asked: false, forwarded: false },
 );
 
@@ -225,7 +246,7 @@ await check(
 
 await check(
   "elicitation error stays denied without fallback",
-  { threshold: 250, elapsedMs: 0, elicitError: true, askResult: "approved" },
+  { threshold: 750, elapsedMs: 0, elicitError: true, askResult: "approved" },
   { verdict: "ask→denied", fallback: false, asked: false, forwarded: false },
 );
 
@@ -242,7 +263,7 @@ caseName = "help lists the flag";
   const help = runMayi(["--help"]);
   assert(help.status === 0, `help exited ${help.status}: ${help.stderr}`);
   assert(help.stdout.includes("--elicit-autodecline-ms"), "help text missing --elicit-autodecline-ms");
-  assert(help.stdout.includes("250"), "help text should mention the 250 default");
+  assert(help.stdout.includes("750"), "help text should mention the 750 default");
   if (help.status === 0 && help.stdout.includes("--elicit-autodecline-ms")) console.log("ok help lists the flag");
 }
 
@@ -257,7 +278,7 @@ caseName = "symlink entry point still starts";
 }
 
 caseName = "flag rejects values that are not non-negative integers";
-for (const bad of ["-1", "1.5", "foo", "+10", "", "250ms"]) {
+for (const bad of ["-1", "1.5", "foo", "+10", "", "750ms"]) {
   const result = runMayi(["--elicit-autodecline-ms", bad, "--", process.execPath, "-e", "process.exit(0)"]);
   const stderr = result.stderr || "";
   assert(result.status === 1, `value ${JSON.stringify(bad)} exited ${result.status}, stderr=${stderr}`);
@@ -283,7 +304,7 @@ function configLine(ms) {
   assert(off.includes("[CONFIG] elicit auto-decline: off"), `0 not logged as off:\n${off}`);
   assert(!off.includes("requires a non-negative integer"), "0 was rejected");
   assert(custom.includes("[CONFIG] elicit auto-decline: 1000ms"), `1000 not logged:\n${custom}`);
-  assert((omitted.stderr || "").includes("[CONFIG] elicit auto-decline: 250ms"), `default not 250:\n${omitted.stderr}`);
+  assert((omitted.stderr || "").includes("[CONFIG] elicit auto-decline: 750ms"), `default not 750:\n${omitted.stderr}`);
   if (off.includes("off") && custom.includes("1000ms")) console.log("ok flag accepts 0 and other non-negative integers");
 }
 
