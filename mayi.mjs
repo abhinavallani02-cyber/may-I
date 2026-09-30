@@ -11,24 +11,29 @@
 //            elicitation/create request sent to the client -- it
 //            renders in the client's own UI, not a terminal. Otherwise
 //            this falls back to /dev/tty (not stdin -- stdin is the
-//            MCP client's channel, not a human's). Either way: approve
-//            -> forwarded like allow. deny/cancel/timeout -> denied
-//            like deny. Other in-flight lines are NOT blocked while a
-//            prompt is pending -- only that one request waits.
+//            MCP client's channel, not a human's). A decline or cancel
+//            that comes back faster than a human could have answered is
+//            the same fallback: the client claimed support but did not
+//            actually ask (Claude Code VS Code bug
+//            anthropics/claude-code#79174). Either way: approve ->
+//            forwarded like allow. deny/cancel/timeout -> denied like
+//            deny. Other in-flight lines are NOT blocked while a prompt
+//            is pending -- only that one request waits.
 // Everything that isn't a tools/call request is still pure passthrough,
 // with one exception in the client->server direction: replies to
 // elicitation requests may-i itself originated. Those are addressed to
 // may-i, not the server, so they're consumed here and never forwarded.
 
-import { readFileSync, createReadStream, createWriteStream, appendFileSync, existsSync } from "node:fs";
+import { readFileSync, createReadStream, createWriteStream, appendFileSync, existsSync, realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { parse as parseYaml } from "yaml";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HELP_TEXT = `mayi -- an MCP proxy that enforces allow/deny/ask policy on tool calls
 
 Usage:
-  mayi [--policy <file>] [--audit <file>] [--audit-include-args] -- <command> [args...]
+  mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] -- <command> [args...]
 
 Everything after -- is the real MCP server to spawn and front.
 
@@ -40,30 +45,46 @@ Options:
   --audit-include-args  Include call arguments in the audit log. Off by
                          default -- arguments can carry file contents,
                          paths, or other sensitive data.
+  --elicit-autodecline-ms <n>
+                        A decline or cancel faster than <n> milliseconds
+                         is treated as the client auto-declining (no UI)
+                         and falls back to the /dev/tty prompt. Default
+                         250. 0 disables it.
   -h, --help            Show this help and exit.
 
 Example:
   mayi --policy policy.yaml -- npx -y @modelcontextprotocol/server-filesystem /path/to/allow`;
 
-if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  console.log(HELP_TEXT);
-  process.exit(0);
+// Set in main() from argv, or by configureForTest(). Defaults match the
+// CLI defaults so a direct run that hasn't finished parsing yet still
+// fails closed if anything asks early.
+let auditPath = "audit.jsonl";
+let auditIncludeArgs = false;
+let elicitAutoDeclineMs = 250;
+
+// Replaced in tests so the suite can stub the terminal prompt and the
+// monotonic clock. The CLI leaves both null: askHuman reads /dev/tty,
+// and timestamps come from performance.now().
+let askHumanOverride = null;
+let clockOverride = null;
+
+function monotonicNow() {
+  // performance.now() is monotonic (the same clock family as
+  // process.hrtime), so a wall-clock step can't make a slow reply look
+  // instant or stretch a same-tick auto-decline past the threshold.
+  return clockOverride ? clockOverride() : performance.now();
 }
 
-const sepIndex = process.argv.indexOf("--");
-if (sepIndex === -1 || sepIndex === process.argv.length - 1) {
-  console.error("mayi: no server command given -- everything after \"--\" is the command to run.");
-  console.error();
-  console.error(HELP_TEXT);
-  process.exit(1);
+// Non-negative integer, same indexOf-and-next-arg shape as --policy
+// and --audit, plus a check those flags don't need because they aren't
+// numbers. 0 is valid and disables the auto-decline heuristic.
+function parseNonNegativeInt(raw, flag) {
+  if (typeof raw !== "string" || !/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    console.error(`mayi: ${flag} requires a non-negative integer, got ${raw === undefined ? "nothing" : JSON.stringify(raw)}`);
+    process.exit(1);
+  }
+  return Number(raw);
 }
-const beforeSep = process.argv.slice(2, sepIndex);
-const policyFlagIndex = beforeSep.indexOf("--policy");
-const explicitPolicyPath = policyFlagIndex === -1 ? null : beforeSep[policyFlagIndex + 1];
-const auditFlagIndex = beforeSep.indexOf("--audit");
-const auditPath = auditFlagIndex === -1 ? "audit.jsonl" : beforeSep[auditFlagIndex + 1];
-const auditIncludeArgs = beforeSep.includes("--audit-include-args");
-const [command, ...args] = process.argv.slice(sepIndex + 1);
 
 // Zero-config fallback: if no --policy was given and there's no
 // policy.yaml in the current directory, use a built-in conservative
@@ -80,24 +101,7 @@ const BUILTIN_DEFAULT_POLICY = {
   ],
 };
 
-let policyPath = explicitPolicyPath;
-let policy;
-let policySource;
-if (policyPath) {
-  if (!existsSync(policyPath)) {
-    console.error(`mayi: policy file not found: ${policyPath}`);
-    process.exit(1);
-  }
-  policy = loadPolicyFile(policyPath);
-  policySource = policyPath;
-} else if (existsSync("policy.yaml")) {
-  policyPath = "policy.yaml";
-  policy = loadPolicyFile(policyPath);
-  policySource = policyPath;
-} else {
-  policy = BUILTIN_DEFAULT_POLICY;
-  policySource = "built-in default (reads allowed, everything else asks)";
-}
+let policy = BUILTIN_DEFAULT_POLICY;
 
 // Reads and parses a policy YAML file, exiting with a clear message
 // instead of a raw stack trace on malformed YAML or a missing/invalid
@@ -124,9 +128,6 @@ function loadPolicyFile(path) {
   return parsed;
 }
 
-console.error(`[CONFIG] policy: ${policySource}`);
-console.error(`[CONFIG] audit mode: ${auditIncludeArgs ? "decisions + args" : "decisions only"}`);
-
 // Appends one decision to the audit log. fs.appendFileSync issues a
 // single write syscall per call with the O_APPEND flag, so concurrent
 // appends from this process can't interleave mid-line -- each call is
@@ -149,7 +150,10 @@ function globToRegex(glob) {
   const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`);
 }
-const compiledRules = policy.rules.map((rule) => ({ ...rule, regex: globToRegex(rule.tool) }));
+let compiledRules = [];
+function compileRules(rules) {
+  compiledRules = rules.map((rule) => ({ ...rule, regex: globToRegex(rule.tool) }));
+}
 
 // Argument keys checked against a rule's path_prefix. Different tools
 // use different names for "the path this call touches" -- read/write
@@ -220,7 +224,7 @@ function inspectInitialize(msg) {
 // no real peer would independently produce is a stronger guarantee than
 // picking a numeric range and hoping nothing else lands in it.
 let elicitCounter = 0;
-const pendingElicitations = new Map(); // id -> { resolve }
+const pendingElicitations = new Map(); // id -> { resolve, sentAt }
 
 function nextElicitId() {
   elicitCounter += 1;
@@ -233,10 +237,17 @@ function nextElicitId() {
 // reply. The reply arrives back on process.stdin (client -> may-i), same
 // as any client request, and is intercepted in handleClientLine before
 // it would otherwise be forwarded to the child -- see there. Resolves to
-// "approved", "denied", or "cancelled"; never rejects -- errors and
-// timeouts both resolve to "denied" so a failure here can never fail
-// open into an unapproved tools/call going through.
-function askViaElicitation(name, args) {
+// "approved", "denied", "cancelled", "approved(tty-fallback)", or
+// "denied(tty-fallback)"; never rejects. An elicitation error or timeout
+// resolves to "denied". A tty fallback that throws, times out, or
+// returns anything other than "approved" resolves to
+// "denied(tty-fallback)". A failure here can never fail open into an
+// unapproved tools/call going through.
+//
+// callId is the client's tools/call id, used only if a too-fast
+// non-accept has to fall back to askHuman. The elicitation's own id
+// stays in the mayi-elicit-N space.
+function askViaElicitation(callId, name, args) {
   const id = nextElicitId();
   return new Promise((resolve) => {
     let settled = false;
@@ -248,12 +259,34 @@ function askViaElicitation(name, args) {
       resolve("denied");
     }, ASK_TIMEOUT_MS);
 
+    // Stamp the send with a monotonic clock at dispatch, before the
+    // bytes go out, so the reply's elapsed time can't start late.
+    const sentAt = monotonicNow();
     pendingElicitations.set(id, {
+      sentAt,
       resolve(outcome) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         pendingElicitations.delete(id);
+        if (outcome && outcome.autoDeclined) {
+          console.error("[ASK] elicitation auto-declined by client (likely unsupported), falling back to terminal prompt");
+          // askHuman resolves "approved" or "denied", or rejects if
+          // something outside promptOnce throws. Anything other than an
+          // explicit approval -- including a throw, a timeout, or no
+          // tty -- is a deny. Never allow on an error.
+          Promise.resolve()
+            .then(() => askHuman(callId, name, args))
+            .then(
+              (human) => resolve(human === "approved" ? "approved(tty-fallback)" : "denied(tty-fallback)"),
+              (err) => {
+                const detail = err && err.message ? err.message : err;
+                console.error(`[ASK] id=${callId} tty fallback failed (${detail}), defaulting to deny`);
+                resolve("denied(tty-fallback)");
+              }
+            );
+          return;
+        }
         resolve(outcome);
       },
     });
@@ -282,16 +315,28 @@ function askViaElicitation(name, args) {
   });
 }
 
+// True when a decline or cancel arrived too fast to be a person
+// answering the prompt. At or over the threshold it's a real decision.
+// 0 disables the heuristic entirely.
+function isFastAutoDecline(pending) {
+  if (!(elicitAutoDeclineMs > 0)) return false;
+  const elapsed = monotonicNow() - pending.sentAt;
+  return elapsed < elicitAutoDeclineMs;
+}
+
 // Handles a reply on process.stdin matching one of may-i's own
 // outstanding elicitation ids. Maps the client's response to an outcome:
 //   action "accept" + content.approve === "approve" -> "approved"
 //   action "accept" + content.approve === "deny"     -> "denied"
 //   action "decline"                                 -> "denied"
+//      (or { autoDeclined } if it arrived under the threshold)
 //   action "cancel"                                  -> "cancelled"
+//      (or { autoDeclined } if it arrived under the threshold)
 //   anything else (malformed, error response, unexpected content) -> "denied"
 // Never resolves to "approved" except on an explicit accept+approve --
 // every other shape of reply denies, so a malformed or unexpected
-// response can't accidentally let a call through.
+// response can't accidentally let a call through. The accept branch is
+// intentionally not timed: a fast explicit approval is still an approval.
 function handleElicitResponse(msg) {
   const pending = pendingElicitations.get(msg.id);
   if (!pending) return; // not one of ours (shouldn't happen -- caller checks first)
@@ -302,11 +347,13 @@ function handleElicitResponse(msg) {
   }
   const action = msg.result?.action;
   if (action === "cancel") {
-    pending.resolve("cancelled");
+    pending.resolve(isFastAutoDecline(pending) ? { autoDeclined: true } : "cancelled");
   } else if (action === "accept" && msg.result?.content?.approve === "approve") {
     pending.resolve("approved");
+  } else if (action === "decline" && isFastAutoDecline(pending)) {
+    pending.resolve({ autoDeclined: true });
   } else {
-    // decline, or accept with any other content -- both deny
+    // slow decline, or accept with any other content -- both deny
     pending.resolve("denied");
   }
 }
@@ -396,30 +443,13 @@ function promptOnce(id, name, args) {
 // keep flowing while a prompt (or several, queued) is pending.
 let askQueue = Promise.resolve();
 function askHuman(id, name, args) {
+  if (askHumanOverride) return askHumanOverride(id, name, args);
   const result = askQueue.then(() => promptOnce(id, name, args));
   askQueue = result.catch(() => {}); // keep the chain alive even if a link ever rejects
   return result;
 }
 
-const child = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });
-
-// stdin -> child.stdin, buffered and split on newlines. Every line is
-// still forwarded verbatim UNLESS it's a tools/call request that policy
-// denies -- that's the one case where the raw `line` is deliberately not
-// written to child.stdin. Buffering/splitting logic is unchanged from
-// the pure-passthrough version: preserves line boundaries regardless of
-// how bytes were chunked on the way in.
-let stdinBuffer = "";
-process.stdin.on("data", (chunk) => {
-  stdinBuffer += chunk.toString();
-  let newlineIndex;
-  while ((newlineIndex = stdinBuffer.indexOf("\n")) !== -1) {
-    const line = stdinBuffer.slice(0, newlineIndex);
-    stdinBuffer = stdinBuffer.slice(newlineIndex + 1);
-    handleClientLine(line);
-  }
-});
-process.stdin.on("end", () => child.stdin.end());
+let child = null;
 
 // Parses a raw line from the client. Non-JSON-RPC lines are forwarded
 // untouched. Two kinds of lines get special handling before the general
@@ -474,12 +504,16 @@ async function handleClientLine(line) {
   let verdictLabel = action;
 
   if (action === "ask") {
-    // "approved" | "denied" | "cancelled" (elicitation only -- the tty
-    // path never produces "cancelled", it only ever approves or denies).
+    // "approved" | "denied" | "cancelled" from elicitation, or
+    // "approved" | "denied" from the tty path. A too-fast decline or
+    // cancel comes back as "approved(tty-fallback)" or
+    // "denied(tty-fallback)" after askHuman runs. Only an explicit
+    // approval allows the call; the fallback forms are explicit too,
+    // and every error shape stays a deny.
     const outcome = (elicitationSupport.form || elicitationSupport.url)
-      ? await askViaElicitation(name, args)
+      ? await askViaElicitation(msg.id, name, args)
       : await askHuman(msg.id, name, args);
-    decision = outcome === "approved" ? "allow" : "deny";
+    decision = outcome === "approved" || outcome === "approved(tty-fallback)" ? "allow" : "deny";
     verdictLabel = `ask→${outcome}`;
   }
 
@@ -499,43 +533,165 @@ async function handleClientLine(line) {
   child.stdin.write(line + "\n");
 }
 
-// child.stdout -> stdout, same buffering treatment in the other direction.
-let stdoutBuffer = "";
-child.stdout.on("data", (chunk) => {
-  stdoutBuffer += chunk.toString();
-  let newlineIndex;
-  while ((newlineIndex = stdoutBuffer.indexOf("\n")) !== -1) {
-    const line = stdoutBuffer.slice(0, newlineIndex);
-    stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-    process.stdout.write(line + "\n");
-  }
-});
-
-// child.stderr is already wired straight through via stdio: "inherit"
-// above -- no buffering needed, it's not part of the framed protocol.
-
-// If the child dies, we die the same way, so the client sees the same
-// failure mode as if it had spawned the real server itself.
-child.on("exit", (code, signal) => {
-  if (signal) {
-    process.kill(process.pid, signal);
-  } else {
-    process.exit(code ?? 0);
-  }
-});
-
-child.on("error", (err) => {
-  console.error(`mayi: failed to start child process: ${err.message}`);
-  process.exit(1);
-});
-
-// If may-i itself is killed, kill the child too -- no orphaned processes.
-// Registering a signal listener at all disables Node's default behavior
-// of exiting on that signal, so this handler must exit explicitly --
-// otherwise may-i hangs forever after Ctrl+C, waiting on nothing.
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(sig, () => {
-    child.kill(sig);
+// Wires stdio, spawns the real server, and stays alive. Not run when
+// this file is imported by the test suite -- see isDirectRun() below.
+function main() {
+  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+    console.log(HELP_TEXT);
     process.exit(0);
+  }
+
+  const sepIndex = process.argv.indexOf("--");
+  if (sepIndex === -1 || sepIndex === process.argv.length - 1) {
+    console.error("mayi: no server command given -- everything after \"--\" is the command to run.");
+    console.error();
+    console.error(HELP_TEXT);
+    process.exit(1);
+  }
+  const beforeSep = process.argv.slice(2, sepIndex);
+  const policyFlagIndex = beforeSep.indexOf("--policy");
+  const explicitPolicyPath = policyFlagIndex === -1 ? null : beforeSep[policyFlagIndex + 1];
+  const auditFlagIndex = beforeSep.indexOf("--audit");
+  auditPath = auditFlagIndex === -1 ? "audit.jsonl" : beforeSep[auditFlagIndex + 1];
+  auditIncludeArgs = beforeSep.includes("--audit-include-args");
+  const elicitFlagIndex = beforeSep.indexOf("--elicit-autodecline-ms");
+  if (elicitFlagIndex !== -1) {
+    elicitAutoDeclineMs = parseNonNegativeInt(beforeSep[elicitFlagIndex + 1], "--elicit-autodecline-ms");
+  }
+  const [command, ...args] = process.argv.slice(sepIndex + 1);
+
+  // Zero-config fallback: if no --policy was given and there's no
+  // policy.yaml in the current directory, use a built-in conservative
+  // default rather than requiring a config file to exist before may-i can
+  // run at all. Reads are safe on their own; everything else asks, so a
+  // brand-new user gets prompted rather than silently allowed or blocked.
+  let policyPath = explicitPolicyPath;
+  let policySource;
+  if (policyPath) {
+    if (!existsSync(policyPath)) {
+      console.error(`mayi: policy file not found: ${policyPath}`);
+      process.exit(1);
+    }
+    policy = loadPolicyFile(policyPath);
+    policySource = policyPath;
+  } else if (existsSync("policy.yaml")) {
+    policyPath = "policy.yaml";
+    policy = loadPolicyFile(policyPath);
+    policySource = policyPath;
+  } else {
+    policy = BUILTIN_DEFAULT_POLICY;
+    policySource = "built-in default (reads allowed, everything else asks)";
+  }
+  compileRules(policy.rules);
+
+  console.error(`[CONFIG] policy: ${policySource}`);
+  console.error(`[CONFIG] audit mode: ${auditIncludeArgs ? "decisions + args" : "decisions only"}`);
+  console.error(`[CONFIG] elicit auto-decline: ${elicitAutoDeclineMs === 0 ? "off" : elicitAutoDeclineMs + "ms"}`);
+
+  child = spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });
+
+  // stdin -> child.stdin, buffered and split on newlines. Every line is
+  // still forwarded verbatim UNLESS it's a tools/call request that policy
+  // denies -- that's the one case where the raw `line` is deliberately not
+  // written to child.stdin. Buffering/splitting logic is unchanged from
+  // the pure-passthrough version: preserves line boundaries regardless of
+  // how bytes were chunked on the way in.
+  let stdinBuffer = "";
+  process.stdin.on("data", (chunk) => {
+    stdinBuffer += chunk.toString();
+    let newlineIndex;
+    while ((newlineIndex = stdinBuffer.indexOf("\n")) !== -1) {
+      const line = stdinBuffer.slice(0, newlineIndex);
+      stdinBuffer = stdinBuffer.slice(newlineIndex + 1);
+      handleClientLine(line);
+    }
   });
+  process.stdin.on("end", () => child.stdin.end());
+
+  // child.stdout -> stdout, same buffering treatment in the other direction.
+  let stdoutBuffer = "";
+  child.stdout.on("data", (chunk) => {
+    stdoutBuffer += chunk.toString();
+    let newlineIndex;
+    while ((newlineIndex = stdoutBuffer.indexOf("\n")) !== -1) {
+      const line = stdoutBuffer.slice(0, newlineIndex);
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      process.stdout.write(line + "\n");
+    }
+  });
+
+  // child.stderr is already wired straight through via stdio: "inherit"
+  // above -- no buffering needed, it's not part of the framed protocol.
+
+  // If the child dies, we die the same way, so the client sees the same
+  // failure mode as if it had spawned the real server itself.
+  child.on("exit", (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+    } else {
+      process.exit(code ?? 0);
+    }
+  });
+
+  child.on("error", (err) => {
+    console.error(`mayi: failed to start child process: ${err.message}`);
+    process.exit(1);
+  });
+
+  // If may-i itself is killed, kill the child too -- no orphaned processes.
+  // Registering a signal listener at all disables Node's default behavior
+  // of exiting on that signal, so this handler must exit explicitly --
+  // otherwise may-i hangs forever after Ctrl+C, waiting on nothing.
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+    process.on(sig, () => {
+      child.kill(sig);
+      process.exit(0);
+    });
+  }
 }
+
+// In-process harness for test-elicit-fallback.mjs. The CLI never calls
+// this. askHuman is stubbed here so tests don't open /dev/tty.
+export function configureForTest({
+  rules,
+  auditFile,
+  includeArgs = false,
+  autoDeclineMs = 250,
+  childStdin,
+  askHuman: askHumanFn = null,
+  now = null,
+}) {
+  policy = { rules };
+  compileRules(rules);
+  auditPath = auditFile;
+  auditIncludeArgs = includeArgs;
+  elicitAutoDeclineMs = autoDeclineMs;
+  elicitationSupport = { form: false, url: false };
+  pendingElicitations.clear();
+  elicitCounter = 0;
+  askQueue = Promise.resolve();
+  askHumanOverride = askHumanFn;
+  clockOverride = now;
+  child = { stdin: childStdin };
+}
+
+// True when this file is the process entry point, including when the
+// npm bin is a symlink to it. Both sides are realpath'd so a symlink
+// still starts the proxy. On any uncertainty, start -- a silent no-op
+// would look like a hung client. Importing from the test script does
+// not match, so the suite can call handleClientLine without spawning.
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return true;
+  try {
+    const entryUrl = pathToFileURL(realpathSync(entry)).href;
+    const selfUrl = pathToFileURL(realpathSync(fileURLToPath(import.meta.url))).href;
+    return entryUrl === selfUrl;
+  } catch {
+    return true;
+  }
+}
+
+export { handleClientLine };
+
+if (isDirectRun()) main();

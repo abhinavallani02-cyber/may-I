@@ -47,10 +47,12 @@ where interactive VS Code sessions are internally misclassified as
 non-interactive ("print mode") specifically for the elicitation path,
 even though the same session correctly renders other interactive prompts
 (permission dialogs, `AskUserQuestion`). Until that's fixed upstream,
-`ask` verdicts against the VS Code extension will silently deny rather
-than prompt — the correct behavior, since may-i denies on any non-accept
-response rather than failing open, but not a working checkpoint until
-Claude Code fixes its side.
+may-i treats a `decline` or `cancel` that arrives faster than a person
+could plausibly have answered (under 250ms by default, see
+`--elicit-autodecline-ms`) as "the client cannot ask" rather than "the
+user said no", and falls back to the `/dev/tty` prompt. A non-accept at
+or after that threshold is still a real decision. The fallback fails
+closed: no terminal, a timeout, or an error denies the call.
 
 ## Install
 
@@ -78,7 +80,7 @@ change anything.
 ## Usage
 
 ```
-mayi [--policy <file>] [--audit <file>] [--audit-include-args] -- <command> [args...]
+mayi [--policy <file>] [--audit <file>] [--audit-include-args] [--elicit-autodecline-ms <n>] -- <command> [args...]
 ```
 
 Everything after `--` is the real MCP server to spawn and front. For
@@ -102,6 +104,12 @@ Flags:
 - `--audit <file>` — path to the audit log. Defaults to `audit.jsonl`.
 - `--audit-include-args` — include each call's arguments in the audit log.
   Off by default; see [Audit logging](#audit-logging).
+- `--elicit-autodecline-ms <n>` — if an elicitation `decline` or `cancel`
+  comes back in less than `<n>` milliseconds, treat it as the client
+  auto-declining without showing UI (the Claude Code bug above) and fall
+  back to the `/dev/tty` prompt instead of recording a user denial.
+  Default `250`. `0` disables the heuristic, so every non-accept is a
+  real decision. Must be a non-negative integer.
 - `-h`, `--help` — print usage and exit.
 
 Working on may-i itself? Clone the repo and run it straight from source
@@ -155,12 +163,20 @@ allowing it.
 
 ## Audit logging
 
-Every verdict — `allow`, `deny`, `ask` → approved, or `ask` → denied — is
-appended to the audit log as one JSON object per line:
+Every verdict — `allow`, `deny`, or an `ask` outcome — is appended to
+the audit log as one JSON object per line:
 
 ```json
 {"timestamp":"2026-08-09T03:21:42.139Z","id":3,"tool":"write_file","verdict":"ask→approved"}
 ```
+
+`ask` verdicts are `ask→approved`, `ask→denied`, or `ask→cancelled`.
+When a too-fast elicitation decline or cancel was treated as the client
+being unable to ask, and the terminal prompt decided instead, the
+verdict is `ask→approved(tty-fallback)` or `ask→denied(tty-fallback)`,
+so the log shows that fallback apart from a normal answer. A fallback
+that cannot ask (no tty, timeout, or error) is
+`ask→denied(tty-fallback)` — never an allow.
 
 By default the log records only the decision: timestamp, request id, tool
 name, and verdict. It does **not** include the call's arguments — file
