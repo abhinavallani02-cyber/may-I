@@ -456,6 +456,50 @@ await check("upstream drop mid-session errors the pending call instead of allowi
   }
 });
 
+await check("a granted call that loses the upstream is not an allow", async () => {
+  const dir = tempDir();
+  const fixture = await startStreamable();
+  try {
+    const policy = join(dir, "policy.yaml");
+    const audit = join(dir, "audit.jsonl");
+    writeFileSync(policy, "rules:\n  - tool: ask_tool\n    action: ask\n");
+    const proxy = startProxy(["--policy", policy, "--audit", audit, "--upstream-url", fixture.url]);
+    try {
+      await proxy.stderr.until("[CONFIG] upstream: connected");
+      await initialize(proxy, { elicitation: { form: {} } });
+      send(proxy.child, toolCall(2, "ask_tool", { text: "once" }));
+      const elicit = JSON.parse(await proxy.stdout.nextLine());
+      assert(elicit.method === "elicitation/create", JSON.stringify(elicit));
+      assert(elicit.params?.requestedSchema?.properties?.scope, "grants should ask once or session");
+      send(proxy.child, {
+        jsonrpc: "2.0",
+        id: elicit.id,
+        result: { action: "accept", content: { approve: "approve", scope: "session" } },
+      });
+      const allowed = JSON.parse(await proxy.stdout.nextLine());
+      assert(allowed.result?.content?.[0]?.text === "echo:once", JSON.stringify(allowed));
+      assert(proxy.stderr.text.includes("[GRANT] tool=ask_tool rule=ask_tool ttl="), proxy.stderr.text);
+      fixture.drop();
+      send(proxy.child, toolCall(3, "ask_tool", { text: "again" }));
+      const dropped = JSON.parse(await proxy.stdout.nextLine());
+      assert(dropped.error && !dropped.result, JSON.stringify(dropped));
+      assert(dropped.method !== "elicitation/create", "the grant should apply without asking again");
+      assert(dropped.error.code === -32000, JSON.stringify(dropped));
+      const entries = readAudit(audit);
+      assert(
+        entries.map((entry) => entry.verdict).join(",") === "ask→approved,ask→granted(session,upstream-error)",
+        JSON.stringify(entries),
+      );
+      assert(!entries.some((entry) => entry.verdict === "allow" || entry.verdict === "ask→granted(session)"), JSON.stringify(entries));
+    } finally {
+      stop(proxy.child);
+    }
+  } finally {
+    fixture.drop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 await check("sse transport forwards an allow", async () => {
   const dir = tempDir();
   const fixture = await startSse();
