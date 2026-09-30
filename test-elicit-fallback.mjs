@@ -5,13 +5,14 @@
 // attached to it.
 //
 // Covers: a fast decline falling back to the stub, a decline at/over
-// the threshold honored as a user deny, accept left unchanged, and
-// threshold 0 disabling the fallback.
+// the threshold honored as a user deny, accept left unchanged, threshold
+// 0 disabling the fallback (including a fast cancel staying cancelled),
+// and SIGINT/SIGTERM actually exiting may-i and its child.
 
-import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { configureForTest, handleClientLine } from "./mayi.mjs";
 
 const AUTO_LOG = "[ASK] elicitation auto-declined by client (likely unsupported), falling back to terminal prompt";
@@ -214,6 +215,14 @@ await check(
   { verdict: "ask→denied", fallback: false, asked: false, forwarded: false },
 );
 
+// --elicit-autodecline-ms 0. A fast cancel is a genuine cancel, same
+// as a fast decline is a genuine denial: no tty fallback.
+await check(
+  "threshold 0 treats a fast cancel as a genuine cancel",
+  { threshold: 0, elapsedMs: 0, result: cancel, askResult: "approved" },
+  { verdict: "ask→cancelled", fallback: false, asked: false, forwarded: false },
+);
+
 await check(
   "elicitation error stays denied without fallback",
   { threshold: 250, elapsedMs: 0, elicitError: true, askResult: "approved" },
@@ -277,6 +286,115 @@ function configLine(ms) {
   assert((omitted.stderr || "").includes("[CONFIG] elicit auto-decline: 250ms"), `default not 250:\n${omitted.stderr}`);
   if (off.includes("off") && custom.includes("1000ms")) console.log("ok flag accepts 0 and other non-negative integers");
 }
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// null when the pid is alive. Otherwise the error from process.kill(pid, 0).
+function probePid(pid) {
+  try {
+    process.kill(pid, 0);
+    return null;
+  } catch (err) {
+    return err;
+  }
+}
+
+// Child death is visible a moment after may-i signals it (reap / reparent).
+// Poll until kill(pid, 0) throws ESRCH, or the short window runs out.
+async function waitForChildGone(pid, windowMs) {
+  const deadline = Date.now() + windowMs;
+  let err = probePid(pid);
+  while (!(err && err.code === "ESRCH") && Date.now() < deadline) {
+    await sleep(40);
+    err = probePid(pid);
+  }
+  return err;
+}
+
+// Spawns mayi in front of a node child that prints its pid and then
+// idles. Sends `signal` to mayi only, and requires mayi to exit within
+// about 3s and the child to be gone (ESRCH) shortly after.
+async function checkShutdown(signal) {
+  caseName = `shutdown on ${signal}`;
+  const before = failures;
+  const idlePath = join(dir, `idle-${signal}.mjs`);
+  writeFileSync(idlePath, "process.stdout.write(String(process.pid) + \"\\n\");\nsetInterval(() => {}, 1e9);\n");
+  const auditFile = join(dir, `audit-shutdown-${signal}.jsonl`);
+
+  const mayi = spawn(process.execPath, [
+    resolve("mayi.mjs"),
+    "--audit", auditFile,
+    "--",
+    process.execPath,
+    idlePath,
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+
+  let stdout = "";
+  let stderr = "";
+  mayi.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+  mayi.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+
+  let childPid = null;
+  try {
+    childPid = await new Promise((resolvePid, rejectPid) => {
+      const timer = setTimeout(() => {
+        rejectPid(new Error(`child pid not seen within 3s\nstdout=${JSON.stringify(stdout)}\nstderr=${stderr}`));
+      }, 3000);
+      const onData = () => {
+        const line = stdout.split("\n").map((part) => part.trim()).find((part) => /^[0-9]+$/.test(part));
+        if (!line) return;
+        clearTimeout(timer);
+        mayi.stdout.off("data", onData);
+        resolvePid(Number(line));
+      };
+      mayi.stdout.on("data", onData);
+      mayi.once("exit", (code, sig) => {
+        clearTimeout(timer);
+        rejectPid(new Error(`mayi exited before the child printed its pid (code=${code} signal=${sig})\nstderr=${stderr}`));
+      });
+      onData();
+    });
+
+    const childBefore = probePid(childPid);
+    assert(childBefore === null, `child ${childPid} was not alive before ${signal} (${childBefore && childBefore.code})`);
+
+    const exitPromise = new Promise((resolveExit) => {
+      mayi.once("exit", (code, sig) => resolveExit({ code, sig }));
+    });
+    mayi.kill(signal);
+
+    const outcome = await Promise.race([
+      exitPromise.then((info) => ({ kind: "exit", ...info })),
+      sleep(3000).then(() => ({ kind: "timeout" })),
+    ]);
+
+    if (outcome.kind === "timeout") {
+      fail(`mayi did not exit within 3s after ${signal}`);
+    } else {
+      const gone = await waitForChildGone(childPid, 1000);
+      assert(gone && gone.code === "ESRCH", `child ${childPid} after ${signal}: ${gone ? gone.code : "still alive"}`);
+    }
+  } catch (err) {
+    fail(err && err.stack ? err.stack : String(err));
+  } finally {
+    if (mayi.exitCode === null && mayi.signalCode === null) {
+      try { mayi.kill("SIGKILL"); } catch { /* already gone */ }
+    }
+    if (childPid !== null) {
+      const still = probePid(childPid);
+      if (still === null) {
+        try { process.kill(childPid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    }
+  }
+
+  if (failures === before) console.log(`ok shutdown on ${signal}`);
+}
+
+await checkShutdown("SIGINT");
+await checkShutdown("SIGTERM");
 
 rmSync(dir, { recursive: true, force: true });
 
