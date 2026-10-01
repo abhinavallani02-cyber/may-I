@@ -1,6 +1,9 @@
 // Remote MCP upstream. The client still talks stdio to may-i. This module
 // opens one session to an HTTP server using the SDK's client transports
 // and calls tools through that session. It does not speak HTTP itself.
+// may-i imports this file only from the guarded loader, and only when
+// --upstream-url is set. A stdio run never loads it, so it never loads
+// the SDK.
 //
 // Streamable HTTP is StreamableHTTPClientTransport. SSE is
 // SSEClientTransport, selected only when the operator asks for it.

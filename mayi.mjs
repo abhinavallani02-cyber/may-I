@@ -3,6 +3,7 @@
 // The client always talks stdio to may-i. The upstream is a spawned
 // child (the default) or, with --upstream-url, a remote MCP server
 // reached through the SDK's Streamable HTTP or SSE client transport.
+// The SDK is imported only on that remote path. Stdio never loads it.
 // Stdio forwards every line stdin -> child.stdin and child.stdout ->
 // stdout unchanged, EXCEPT tools/call requests: those are checked
 // against policy.yaml first.
@@ -950,14 +951,62 @@ function safeErrorText(err) {
   return redactString(message, secretValues);
 }
 
-// HTTP/SSE mode. The SDK client connects before any client line is
-// read. If that connection fails, the process exits non-zero and no
-// tools/call is answered with a result. Policy is the same function
-// as stdio. A tools/call that policy allows is forwarded with
-// client.callTool; if the upstream drops, the client gets a JSON-RPC
-// error and the audit label is allow(upstream-error) or
-// ask→approved(upstream-error), never a bare allow.
-async function runUpstream(upstream) {
+const SDK_MISSING_MESSAGE = "HTTP transport requires @modelcontextprotocol/sdk. Install it with npm install @modelcontextprotocol/sdk.";
+
+// True only when the missing module is the SDK itself. A different
+// missing package imported from inside the SDK (zod, for example) also
+// has @modelcontextprotocol/sdk in the path, and that must not take
+// this exit. Node quotes the missing specifier: the path form does not.
+function isMissingSdk(err) {
+  const seen = new Set();
+  let current = err;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    if (
+      current.code === "ERR_MODULE_NOT_FOUND" &&
+      typeof current.message === "string" &&
+      /['"]@modelcontextprotocol\/sdk['"/]/.test(current.message)
+    ) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
+}
+
+// upstream.mjs imports the SDK statically, and the protocol constants
+// come from a second import of @modelcontextprotocol/sdk/types.js.
+// Both run here, before any client line is read and before the
+// upstream connection. A missing SDK exits with one line and no stack.
+// Any other import error is thrown so the caller still fails closed
+// on the existing path, without the install hint and without an allow.
+async function loadHttpTransport() {
+  try {
+    const upstreamMod = await import("./upstream.mjs");
+    const typesMod = await import("@modelcontextprotocol/sdk/types.js");
+    return {
+      openUpstream: upstreamMod.openUpstream,
+      SUPPORTED_PROTOCOL_VERSIONS: typesMod.SUPPORTED_PROTOCOL_VERSIONS,
+      DEFAULT_NEGOTIATED_PROTOCOL_VERSION: typesMod.DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
+    };
+  } catch (err) {
+    if (isMissingSdk(err)) {
+      console.error(SDK_MISSING_MESSAGE);
+      process.exit(1);
+    }
+    throw err;
+  }
+}
+
+// HTTP/SSE mode. loadHttpTransport has already run, before this
+// function and before any client line is read. If the connection
+// fails, the process exits non-zero and no tools/call is answered
+// with a result. Policy is the same function as stdio. A tools/call
+// that policy allows is forwarded with client.callTool; if the
+// upstream drops, the client gets a JSON-RPC error and the audit
+// label is allow(upstream-error) or ask→approved(upstream-error),
+// never a bare allow.
+async function runUpstream(upstream, http) {
   if (upstream.bearerToken) secretValues = [upstream.bearerToken];
 
   console.error(`[CONFIG] upstream: ${upstream.transport} ${upstream.url}`);
@@ -965,8 +1014,7 @@ async function runUpstream(upstream) {
 
   let session;
   try {
-    const { openUpstream } = await import("./upstream.mjs");
-    session = await openUpstream({
+    session = await http.openUpstream({
       url: upstream.url,
       transport: upstream.transport,
       bearerToken: upstream.bearerToken,
@@ -976,7 +1024,7 @@ async function runUpstream(upstream) {
     process.exit(1);
   }
 
-  const { SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } = await import("@modelcontextprotocol/sdk/types.js");
+  const { SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_NEGOTIATED_PROTOCOL_VERSION } = http;
 
   function protocolVersionFor(requested) {
     if (typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)) return requested;
@@ -1097,7 +1145,7 @@ async function runUpstream(upstream) {
 
 // Wires stdio, spawns the real server, and stays alive. Not run when
 // this file is imported by the test suite -- see isDirectRun() below.
-function main() {
+async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     console.log(HELP_TEXT);
     process.exit(0);
@@ -1113,6 +1161,12 @@ function main() {
     console.error(HELP_TEXT);
     process.exit(1);
   }
+  // HTTP only, before policy logs and before stdin is read. Stdio
+  // skips this and never resolves the SDK. A missing SDK exits inside
+  // the loader with one line. Any other import error rejects, and the
+  // handler at the bottom prints it without a stack. No call is answered.
+  let http = null;
+  if (upstream) http = await loadHttpTransport();
   const policyFlagIndex = beforeSep.indexOf("--policy");
   const explicitPolicyPath = policyFlagIndex === -1 ? null : beforeSep[policyFlagIndex + 1];
   const auditFlagIndex = beforeSep.indexOf("--audit");
@@ -1177,10 +1231,7 @@ function main() {
   console.error(`[CONFIG] session grants: ${grantsEnabled() ? grantTtlSeconds + "s" : "off"}`);
 
   if (upstream) {
-    runUpstream(upstream).catch((err) => {
-      console.error(`mayi: ${safeErrorText(err)}`);
-      process.exit(1);
-    });
+    await runUpstream(upstream, http);
     return;
   }
 
@@ -1296,4 +1347,9 @@ function isDirectRun() {
 
 export { handleClientLine, formatTtyPrompt, classifyTtyAnswer };
 
-if (isDirectRun()) main();
+if (isDirectRun()) {
+  main().catch((err) => {
+    console.error(`mayi: ${safeErrorText(err)}`);
+    process.exit(1);
+  });
+}

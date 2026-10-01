@@ -193,6 +193,24 @@ mayi --policy policy.yaml --upstream-url http://127.0.0.1:3000/mcp --bearer-env 
 mayi --policy policy.yaml --upstream-url http://127.0.0.1:3000/sse --transport sse
 ```
 
+`@modelcontextprotocol/sdk` and `zod` are optional peers. npm does not
+install optional peers, so a stdio install of may-i does not include
+them. `zod` is only there because the SDK peers it. Install the SDK
+beside may-i when you use `--upstream-url`:
+
+```
+npm install @modelcontextprotocol/sdk
+```
+
+Current SDK releases depend on `zod` and install it with that command.
+If yours does not, install `zod` too. If the SDK cannot be imported,
+may-i exits 1 before it reads or answers client traffic, prints no
+stack trace, and writes exactly this line to stderr:
+
+```
+HTTP transport requires @modelcontextprotocol/sdk. Install it with npm install @modelcontextprotocol/sdk.
+```
+
 may-i opens the upstream with `@modelcontextprotocol/sdk`'s
 `StreamableHTTPClientTransport` or `SSEClientTransport` before it
 handles client traffic. The SDK performs that session's initialize.
