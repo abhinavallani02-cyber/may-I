@@ -11,6 +11,25 @@ How that commit was identified is in the 1.1.0 pull request.
 
 ## [1.1.0] - 2026-09-30
 
+### Upgrading from 1.0.0
+
+These are the changes that can affect a setup written for 1.0.0.
+
+- A rule may-i cannot compile stops startup. may-i exits 1 before it spawns a child and prints no stack trace. The first line names the file and the rule's 1-based position in that file, what is wrong, the offending value, and the valid set when there is one. The second line says what 1.0.0 did. An unknown action:
+
+  ```
+  mayi: policy.yaml rule 3 has unknown action "alow". Valid actions: allow, deny, ask.
+  mayi: 1.0.0 forwarded calls matching invalid rules (fail-open); 1.1.0 stops at startup instead. See CHANGELOG.md.
+  ```
+
+  A missing `action` uses the same second line: 1.0.0 forwarded the call. A non-mapping rule, a missing `tool`, or a non-string `tool` is not that case. 1.0.0 threw a TypeError and printed a stack trace, and the child did not start. An empty `tool` matched only a tool named `""`. A falsy `path_prefix` (`""`, `null`, and other falsy values) skipped the path check, and the rule matched on the tool name with its action still applied. A non-string `path_prefix` was passed to `String.prototype.startsWith`, which turns it into a string. A `sql` key was ignored, and the rule's action applied to every call matching the tool name. `--policy` is named by the path you passed (`policy.yaml` for the default file). `--rules` is named `rules pack <name>`. The number is the position in that file, not in the combined list.
+
+- `path_prefix` is no longer a string prefix. It is canonical and segment-bounded, and it also reads `repo_path`. `path_prefix: /etc` no longer matches `/etc-backup`. `path_prefix: /prod` no longer matches `/production`. `..` and an existing symlink can now match a deny or ask. Details are under Changed.
+
+- `ask` goes to `elicitation/create` first when the client declares `elicitation.form` or `elicitation.url`. A `decline` or `cancel` in under 750ms (`--elicit-autodecline-ms`, default `750`) falls back to `/dev/tty`. On that prompt, `a` approves and remembers for 1800 seconds (`--grant-ttl`, default `1800`). In 1.0.0 the prompt was `y`/`n`, and `a` denied. `y` and `n` are unchanged. A client that does not declare elicitation still gets `/dev/tty`.
+
+- `npm install mayi-mcp` installs `yaml` only. 1.0.0 also installed `@modelcontextprotocol/server-filesystem`. `@modelcontextprotocol/sdk` and `zod` are optional peers and are not installed. `--upstream-url` needs the SDK. 1.0.0 did not depend on the SDK.
+
 ### Added
 
 - `--rules <pack>` loads `rules/<pack>.yaml` shipped next to the program.
@@ -156,12 +175,12 @@ How that commit was identified is in the 1.1.0 pull request.
   (permissions, a symlink loop, a null byte, or a path argument that is
   not a string), that allow does not match and later allow rules are
   skipped for that call. (`feff3ef`, `9b3fd0d`)
-- A rule that is not a mapping, has no string `tool`, has an `action`
-  other than `allow`, `deny`, or `ask`, has an empty `path_prefix`, or
-  has a `sql` value other than `sql.single` with at least one verb, is a
-  startup error. may-i exits before it spawns a server. 1.0.0 did not
-  reject those shapes at startup. Only `deny` was blocked. `ask` prompted.
-  Any other action was forwarded. (`feff3ef`)
+- A rule may-i cannot compile is a startup error. may-i exits 1 before it
+  spawns a child and prints no stack trace. The first line names the
+  source and the rule's 1-based position in that file, the offending
+  value, and the valid set when there is one. The second line says what
+  1.0.0 did with that shape. See Upgrading from 1.0.0. The rejection of
+  these shapes, as opposed to the wording, is `feff3ef`.
 - Runtime dependencies. Published 1.0.0 depended on
   `@modelcontextprotocol/server-filesystem` `^2026.7.10` and `yaml`
   `^2.9.0`. 1.1.0 depends on `yaml` `^2.9.0` only.

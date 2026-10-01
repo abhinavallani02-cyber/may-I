@@ -25,25 +25,63 @@ const SQL_ARG_KEYS = ["sql", "query", "statement"];
 
 const VERB = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function ruleWhere(index) {
-  return `policy rule ${index + 1}`;
+// Second lines on a startup rejection. Each one is what 1.0.0 did with
+// that shape. Only the action line says "forwarded": that is the case
+// 1.0.0 let the call through.
+export const NOTE_FORWARDED = "1.0.0 forwarded calls matching invalid rules (fail-open); 1.1.0 stops at startup instead. See CHANGELOG.md.";
+export const NOTE_TYPEERROR = "1.0.0 threw a TypeError while compiling this rule and printed a stack trace. It did not start the child. 1.1.0 stops at startup with this message instead. See CHANGELOG.md.";
+export const NOTE_EMPTY_TOOL = '1.0.0 compiled an empty tool as a pattern that matches only a tool named "". 1.1.0 stops at startup instead. See CHANGELOG.md.';
+export const NOTE_FALSY_PREFIX = "1.0.0 skipped the path check for this path_prefix and matched the rule on the tool name alone. Its action still ran. 1.1.0 stops at startup instead. See CHANGELOG.md.";
+export const NOTE_COERCED_PREFIX = "1.0.0 passed this path_prefix to String.prototype.startsWith, which turns a non-string into a string. 1.1.0 stops at startup instead. See CHANGELOG.md.";
+export const NOTE_SQL = "1.0.0 ignored the sql key. The rule matched on the tool name alone and its action still ran. 1.1.0 stops at startup instead. See CHANGELOG.md.";
+
+export function quoteValue(value) {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "undefined") return "missing";
+  try {
+    const text = JSON.stringify(value);
+    if (typeof text === "string") return text;
+  } catch {
+    // A value that cannot be serialized still has to appear in the line.
+  }
+  return String(value);
 }
 
-function compileSql(sql, where) {
+export function ruleFailure(place, detail, note) {
+  return new Error(`${place} ${detail}\n${note}`);
+}
+
+function compileSql(sql, place) {
   if (sql === null || typeof sql !== "object" || Array.isArray(sql)) {
-    throw new Error(`${where}: sql must be a mapping, for example "sql: { single: select }"`);
+    throw ruleFailure(
+      place,
+      `has sql ${quoteValue(sql)}, not a mapping. sql must be a mapping with one key, single, whose value is a statement verb or a list of verbs. Example: { single: select }.`,
+      NOTE_SQL,
+    );
   }
   const keys = Object.keys(sql);
   if (keys.length !== 1 || keys[0] !== "single") {
-    throw new Error(`${where}: sql only supports "single" (one statement verb, or a list of them)`);
+    throw ruleFailure(
+      place,
+      `has sql ${quoteValue(sql)}. Valid key: single.`,
+      NOTE_SQL,
+    );
   }
   const listed = Array.isArray(sql.single) ? sql.single : [sql.single];
   if (listed.length === 0) {
-    throw new Error(`${where}: sql.single must name at least one statement verb`);
+    throw ruleFailure(
+      place,
+      `has sql.single ${quoteValue(sql.single)}, which names no statement verb.`,
+      NOTE_SQL,
+    );
   }
   return listed.map((verb) => {
     if (typeof verb !== "string" || !VERB.test(verb)) {
-      throw new Error(`${where}: sql.single verbs must be statement names like "select"`);
+      throw ruleFailure(
+        place,
+        `has sql.single verb ${quoteValue(verb)}. A verb is a statement name made of letters, digits, and underscores, and it must start with a letter or underscore.`,
+        NOTE_SQL,
+      );
     }
     return verb.toLowerCase();
   });
@@ -52,18 +90,25 @@ function compileSql(sql, where) {
 // Pulls path_prefix / sql.single off a rule. Throws on a shape that
 // would otherwise be ignored -- a typo must not quietly become "no
 // structural check", which would fail open.
-export function compileStructural(rule, index) {
-  const where = ruleWhere(index);
+export function compileStructural(rule, place) {
   let hasPath = false;
   if (Object.prototype.hasOwnProperty.call(rule, "path_prefix")) {
-    if (typeof rule.path_prefix !== "string" || rule.path_prefix.length === 0) {
-      throw new Error(`${where}: path_prefix must be a non-empty string`);
+    const value = rule.path_prefix;
+    if (typeof value !== "string" || value.length === 0) {
+      // 1.0.0 used `if (!rule.path_prefix)`. Empty string, null, 0, and
+      // false skipped the path check. Any other non-string reached
+      // startsWith, which stringifies it.
+      const detail = typeof value === "string"
+        ? 'has empty path_prefix "".'
+        : `has path_prefix ${quoteValue(value)}, not a non-empty string.`;
+      const note = value ? NOTE_COERCED_PREFIX : NOTE_FALSY_PREFIX;
+      throw ruleFailure(place, detail, note);
     }
     hasPath = true;
   }
   let sqlSingle = null;
   if (Object.prototype.hasOwnProperty.call(rule, "sql")) {
-    sqlSingle = compileSql(rule.sql, where);
+    sqlSingle = compileSql(rule.sql, place);
   }
   return { hasPath, hasSql: sqlSingle !== null, sqlSingle };
 }

@@ -381,6 +381,26 @@ The three actions:
 If no rule matches a call, may-i defaults to `ask` rather than silently
 allowing it.
 
+A rule may-i cannot compile is a startup error. may-i exits 1 before it
+spawns a child and prints no stack trace. The first line names the
+source and the rule's position in that file, counting from 1. `--policy`
+uses the path you passed. The default file is `policy.yaml`. `--rules`
+uses `rules pack <name>`. A pack and a policy file are numbered
+separately. When the valid set is fixed, the line lists it:
+
+```
+mayi: policy.yaml rule 3 has unknown action "alow". Valid actions: allow, deny, ask.
+mayi: 1.0.0 forwarded calls matching invalid rules (fail-open); 1.1.0 stops at startup instead. See CHANGELOG.md.
+```
+
+The second line is what 1.0.0 did with that shape. An unknown or missing
+`action` was forwarded. A rule that is not a mapping, a missing `tool`,
+or a non-string `tool` already aborted 1.0.0 with a TypeError and a
+stack trace, and the child did not start. An empty `tool` matched only a
+tool named `""`. A falsy `path_prefix` skipped the path check and the
+rule matched on the tool name. A non-string `path_prefix` was passed to
+`startsWith`. A `sql` key was ignored. See CHANGELOG.md.
+
 ## Session grants
 
 An approval can be remembered so the same kind of call doesn't prompt
