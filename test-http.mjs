@@ -5,7 +5,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -109,10 +109,11 @@ function collect(stream) {
   };
 }
 
-function startProxy(args, env = {}) {
-  const child = spawn(node, [mayiPath, ...args], {
+function startProxy(args, env = {}, options = {}) {
+  const child = spawn(node, [options.entry || mayiPath, ...args], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...env },
+    cwd: options.cwd,
   });
   return { child, stdout: collect(child.stdout), stderr: collect(child.stderr) };
 }
@@ -393,6 +394,138 @@ await check("streamable HTTP ask elicitation approves and then forwards", async 
     }
   } finally {
     fixture.drop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const SDK_MISSING_STDERR = "HTTP transport requires @modelcontextprotocol/sdk. Install it with npm install @modelcontextprotocol/sdk.\n";
+
+// A copy of the runtime whose node_modules has yaml and not the SDK.
+// Resolution starts at the copy, outside this repo, so the SDK installed
+// for the suite is not visible.
+function stageWithoutSdk() {
+  const dir = tempDir();
+  mkdirSync(join(dir, "node_modules"));
+  for (const name of ["mayi.mjs", "upstream.mjs", "structural.mjs"]) {
+    copyFileSync(fileURLToPath(new URL("./" + name, import.meta.url)), join(dir, name));
+  }
+  symlinkSync(
+    fileURLToPath(new URL("./node_modules/yaml", import.meta.url)),
+    join(dir, "node_modules", "yaml"),
+  );
+  return dir;
+}
+
+await check("missing SDK exits 1 with the install line and answers nothing", async () => {
+  const dir = stageWithoutSdk();
+  const seen = [];
+  const server = createServer((req, res) => {
+    seen.push(req.url || "");
+    res.writeHead(500).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  try {
+    const { policy, audit } = writePolicy(dir);
+    const result = spawnSync(
+      node,
+      [join(dir, "mayi.mjs"), "--policy", policy, "--audit", audit, "--upstream-url", `http://127.0.0.1:${port}/mcp`],
+      {
+        encoding: "utf8",
+        cwd: dir,
+        input: JSON.stringify(toolCall(2, "echo", { text: "nope" })) + "\n",
+        timeout: 8000,
+      },
+    );
+    assert(result.status === 1, `status ${result.status}\n${result.stderr}`);
+    assert(result.stderr === SDK_MISSING_STDERR, JSON.stringify(result.stderr));
+    assert(!(result.stdout || "").trim(), result.stdout || "");
+    assert(seen.length === 0, `upstream saw traffic: ${seen.join(",")}`);
+    assert(!existsSync(audit), "a tool call was audited");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await check("an import error that is not a missing SDK does not fail open", async () => {
+  const dir = stageWithoutSdk();
+  writeFileSync(
+    join(dir, "upstream.mjs"),
+    'import "mayi-not-the-sdk";\nexport async function openUpstream() { throw new Error("should not connect"); }\n',
+  );
+  try {
+    const { policy, audit } = writePolicy(dir);
+    const result = spawnSync(
+      node,
+      [join(dir, "mayi.mjs"), "--policy", policy, "--audit", audit, "--upstream-url", "http://127.0.0.1:9/mcp"],
+      {
+        encoding: "utf8",
+        cwd: dir,
+        input: JSON.stringify(toolCall(2, "echo", { text: "nope" })) + "\n",
+        timeout: 8000,
+      },
+    );
+    assert(result.status === 1, `status ${result.status}\n${result.stderr}`);
+    assert(!(result.stderr || "").includes(SDK_MISSING_STDERR.trim()), result.stderr || "");
+    assert(!(result.stderr || "").includes("\n    at "), result.stderr || "");
+    assert((result.stderr || "").startsWith("mayi: "), result.stderr || "");
+    assert(!(result.stdout || "").trim(), result.stdout || "");
+    assert(!existsSync(audit), "a tool call was audited");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await check("stdio allow and deny still work when the SDK is not installed", async () => {
+  const dir = stageWithoutSdk();
+  try {
+    const { policy, audit } = writePolicy(dir);
+    const childPath = join(dir, "child.mjs");
+    writeFileSync(childPath, `
+      let buf = "";
+      process.stdin.on("data", (chunk) => {
+        buf += chunk.toString();
+        let nl;
+        while ((nl = buf.indexOf("\\n")) !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\\n");
+          if (msg.method === "initialize") {
+            reply({ protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "stdio-child", version: "0" } });
+          } else if (msg.method === "tools/call") {
+            reply({ content: [{ type: "text", text: "from-stdio-child:" + msg.params.name }] });
+          } else if (msg.id !== undefined && msg.method) {
+            reply({});
+          }
+        }
+      });
+    `);
+    const proxy = startProxy(
+      ["--policy", policy, "--audit", audit, "--", node, childPath],
+      {},
+      { entry: join(dir, "mayi.mjs"), cwd: dir },
+    );
+    try {
+      await proxy.stderr.until("[CONFIG] policy:");
+      assert(!proxy.stderr.text.includes(SDK_MISSING_STDERR.trim()), proxy.stderr.text);
+      assert(!proxy.stderr.text.includes("@modelcontextprotocol/sdk"), proxy.stderr.text);
+      await initialize(proxy);
+      send(proxy.child, toolCall(2, "echo", { text: "hi" }));
+      const allowed = JSON.parse(await proxy.stdout.nextLine());
+      assert(allowed.result?.content?.[0]?.text === "from-stdio-child:echo", JSON.stringify(allowed));
+      send(proxy.child, toolCall(3, "secret_tool"));
+      const denied = JSON.parse(await proxy.stdout.nextLine());
+      assert(denied.error && denied.error.message.includes("Blocked by policy"), JSON.stringify(denied));
+      const entries = readAudit(audit);
+      assert(entries.map((entry) => entry.verdict).join(",") === "allow,deny", JSON.stringify(entries));
+      assert(!proxy.stdout.text.includes("from-stdio-child:secret_tool"), proxy.stdout.text);
+    } finally {
+      stop(proxy.child);
+    }
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
