@@ -315,26 +315,69 @@ check("documented limitation: single explain matches EXPLAIN DELETE", () => {
   assert(got.action === "allow", `EXPLAIN DELETE is verb explain, got ${got.action} ${got.matchedRule}`);
 });
 
-check("a bad structural rule is rejected instead of ignored", () => {
+const NOTE_FORWARDED = "1.0.0 forwarded calls matching invalid rules (fail-open); 1.1.0 stops at startup instead. See CHANGELOG.md.";
+const NOTE_TYPEERROR = "1.0.0 threw a TypeError while compiling this rule and printed a stack trace. It did not start the child. 1.1.0 stops at startup with this message instead. See CHANGELOG.md.";
+const NOTE_EMPTY_TOOL = '1.0.0 compiled an empty tool as a pattern that matches only a tool named "". 1.1.0 stops at startup instead. See CHANGELOG.md.';
+const NOTE_FALSY_PREFIX = "1.0.0 skipped the path check for this path_prefix and matched the rule on the tool name alone. Its action still ran. 1.1.0 stops at startup instead. See CHANGELOG.md.";
+const NOTE_COERCED_PREFIX = "1.0.0 passed this path_prefix to String.prototype.startsWith, which turns a non-string into a string. 1.1.0 stops at startup instead. See CHANGELOG.md.";
+const NOTE_SQL = "1.0.0 ignored the sql key. The rule matched on the tool name alone and its action still ran. 1.1.0 stops at startup instead. See CHANGELOG.md.";
+
+function ruleMessage(place, detail, note) {
+  return `${place} ${detail}\n${note}`;
+}
+
+check("a bad rule is rejected with the shape and what 1.0.0 did", () => {
   const bad = [
-    [{ tool: "query", sql: { singl: "select" }, action: "allow" }, "only supports"],
-    [{ tool: "query", sql: "select", action: "allow" }, "mapping"],
-    [{ tool: "query", sql: { single: [] }, action: "allow" }, "at least one"],
-    [{ tool: "query", sql: { single: "select;drop" }, action: "allow" }, "statement names"],
-    [{ tool: "write_*", path_prefix: "", action: "deny" }, "non-empty"],
-    [{ tool: "write_*", path_prefix: 1, action: "deny" }, "non-empty"],
-    [{ tool: "write_*", action: "Allow" }, "action must be"],
+    ["not-a-mapping", ruleMessage("policy rule 1", 'is "not-a-mapping", not a mapping.', NOTE_TYPEERROR)],
+    [null, ruleMessage("policy rule 1", "is null, not a mapping.", NOTE_TYPEERROR)],
+    [{ action: "allow" }, ruleMessage("policy rule 1", "is missing tool. tool must be a non-empty string.", NOTE_TYPEERROR)],
+    [{ tool: 1, action: "allow" }, ruleMessage("policy rule 1", "has tool 1, not a string.", NOTE_TYPEERROR)],
+    [{ tool: "", action: "allow" }, ruleMessage("policy rule 1", 'has empty tool "".', NOTE_EMPTY_TOOL)],
+    [{ tool: "write_*", action: "Allow" }, ruleMessage("policy rule 1", 'has unknown action "Allow". Valid actions: allow, deny, ask.', NOTE_FORWARDED)],
+    [{ tool: "write_*" }, ruleMessage("policy rule 1", "is missing action. Valid actions: allow, deny, ask.", NOTE_FORWARDED)],
+    [{ tool: "write_*", path_prefix: "", action: "deny" }, ruleMessage("policy rule 1", 'has empty path_prefix "".', NOTE_FALSY_PREFIX)],
+    [{ tool: "write_*", path_prefix: null, action: "deny" }, ruleMessage("policy rule 1", "has path_prefix null, not a non-empty string.", NOTE_FALSY_PREFIX)],
+    [{ tool: "write_*", path_prefix: 1, action: "deny" }, ruleMessage("policy rule 1", "has path_prefix 1, not a non-empty string.", NOTE_COERCED_PREFIX)],
+    [{ tool: "query", sql: "select", action: "allow" }, ruleMessage("policy rule 1", 'has sql "select", not a mapping. sql must be a mapping with one key, single, whose value is a statement verb or a list of verbs. Example: { single: select }.', NOTE_SQL)],
+    [{ tool: "query", sql: { singl: "select" }, action: "allow" }, ruleMessage("policy rule 1", 'has sql {"singl":"select"}. Valid key: single.', NOTE_SQL)],
+    [{ tool: "query", sql: { single: [] }, action: "allow" }, ruleMessage("policy rule 1", "has sql.single [], which names no statement verb.", NOTE_SQL)],
+    [{ tool: "query", sql: { single: "select;drop" }, action: "allow" }, ruleMessage("policy rule 1", 'has sql.single verb "select;drop". A verb is a statement name made of letters, digits, and underscores, and it must start with a letter or underscore.', NOTE_SQL)],
   ];
-  for (const [rule, needle] of bad) {
-    let threw = false;
+  for (const [rule, expected] of bad) {
+    let message = "";
     try {
       useRules([rule]);
     } catch (err) {
-      threw = true;
-      assert(String(err.message).includes(needle), `${JSON.stringify(rule.sql ?? rule.path_prefix ?? rule.action)} message ${err.message}`);
+      message = String(err.message);
     }
-    assert(threw, `expected rejection for ${JSON.stringify(rule)}`);
+    assert(message === expected, `message:\n${message}\nexpected:\n${expected}`);
   }
+});
+
+check("a pack label keeps the rule number from that pack", () => {
+  let message = "";
+  try {
+    configureForTest({
+      rules: [
+        { tool: "read_*", action: "allow" },
+        { tool: "write_file", action: "alow" },
+      ],
+      rulePlaces: [
+        { label: "rules pack filesystem", number: 1 },
+        { label: "rules pack filesystem", number: 2 },
+      ],
+      auditFile: join(dir, "unused-pack.jsonl"),
+      childStdin: { write() {} },
+    });
+  } catch (err) {
+    message = String(err.message);
+  }
+  const expected = ruleMessage(
+    "rules pack filesystem rule 2",
+    'has unknown action "alow". Valid actions: allow, deny, ask.',
+    NOTE_FORWARDED,
+  );
+  assert(message === expected, `message:\n${message}\nexpected:\n${expected}`);
 });
 
 check("shipped policy.yaml still compiles", () => {
@@ -348,20 +391,56 @@ check("shipped policy.yaml still compiles", () => {
   assert(production.action === "ask", `/production should not match /prod, got ${production.action} ${production.matchedRule}`);
 });
 
-function runMayi(args) {
-  return spawnSync(process.execPath, [resolve("mayi.mjs"), ...args], {
+function expectStartup(args, expected) {
+  const childPath = join(dir, "stay.mjs");
+  writeFileSync(childPath, "console.error('CHILD_RAN');\nsetInterval(() => {}, 1000);\n");
+  const result = spawnSync(process.execPath, [resolve("mayi.mjs"), ...args, "--", process.execPath, childPath], {
     encoding: "utf8",
     timeout: 3000,
-    cwd: process.cwd(),
   });
+  const stderr = result.stderr || "";
+  assert(result.status === 1, `status ${result.status} error ${result.error}\n${stderr}`);
+  assert(stderr === expected, `stderr:\n${stderr}\nexpected:\n${expected}`);
+  assert(!stderr.includes("CHILD_RAN"), "child started");
+  assert(!/^\s+at /m.test(stderr), stderr);
 }
 
-check("a bad policy file fails closed at startup", () => {
-  const badPath = join(dir, "bad.yaml");
-  writeFileSync(badPath, "rules:\n  - tool: query\n    sql:\n      singl: select\n    action: allow\n");
-  const result = runMayi(["--policy", badPath, "--", process.execPath, "-e", "process.exit(0)"]);
-  assert(result.status === 1, `bad policy exited ${result.status}\n${result.stderr}`);
-  assert((result.stderr || "").includes("sql only supports"), result.stderr || "");
+check("startup errors name the file, the rule, and what 1.0.0 did", () => {
+  const file = join(dir, "policy.yaml");
+  const cases = [
+    ["rules:\n  - not-a-mapping\n", `is "not-a-mapping", not a mapping.`, NOTE_TYPEERROR],
+    ["rules:\n  - null\n", "is null, not a mapping.", NOTE_TYPEERROR],
+    ["rules:\n  - [a, b]\n", 'is ["a","b"], not a mapping.', NOTE_TYPEERROR],
+    ["rules:\n  - action: allow\n", "is missing tool. tool must be a non-empty string.", NOTE_TYPEERROR],
+    ["rules:\n  - tool: 1\n    action: allow\n", "has tool 1, not a string.", NOTE_TYPEERROR],
+    ["rules:\n  - tool: \"\"\n    action: allow\n", 'has empty tool "".', NOTE_EMPTY_TOOL],
+    ["rules:\n  - tool: write_file\n", "is missing action. Valid actions: allow, deny, ask.", NOTE_FORWARDED],
+    ["rules:\n  - tool: write_file\n    path_prefix: \"\"\n    action: deny\n", 'has empty path_prefix "".', NOTE_FALSY_PREFIX],
+    ["rules:\n  - tool: write_file\n    path_prefix:\n    action: deny\n", "has path_prefix null, not a non-empty string.", NOTE_FALSY_PREFIX],
+    ["rules:\n  - tool: write_file\n    path_prefix: 1\n    action: deny\n", "has path_prefix 1, not a non-empty string.", NOTE_COERCED_PREFIX],
+    ["rules:\n  - tool: query\n    sql: select\n    action: allow\n", 'has sql "select", not a mapping. sql must be a mapping with one key, single, whose value is a statement verb or a list of verbs. Example: { single: select }.', NOTE_SQL],
+    ["rules:\n  - tool: query\n    sql:\n      singl: select\n    action: allow\n", 'has sql {"singl":"select"}. Valid key: single.', NOTE_SQL],
+    ["rules:\n  - tool: query\n    sql:\n      single: []\n    action: allow\n", "has sql.single [], which names no statement verb.", NOTE_SQL],
+    ["rules:\n  - tool: query\n    sql:\n      single: select;drop\n    action: allow\n", 'has sql.single verb "select;drop". A verb is a statement name made of letters, digits, and underscores, and it must start with a letter or underscore.', NOTE_SQL],
+  ];
+  for (const [yaml, detail, note] of cases) {
+    writeFileSync(file, yaml);
+    expectStartup(
+      ["--policy", file],
+      `mayi: ${file} rule 1 ${detail}\nmayi: ${note}\n`,
+    );
+  }
+
+  const third = join(dir, "third.yaml");
+  writeFileSync(third, "rules:\n  - tool: read_*\n    action: allow\n  - tool: list_*\n    action: allow\n  - tool: write_file\n    action: alow\n");
+  expectStartup(
+    ["--policy", third],
+    `mayi: ${third} rule 3 has unknown action "alow". Valid actions: allow, deny, ask.\nmayi: ${NOTE_FORWARDED}\n`,
+  );
+  expectStartup(
+    ["--rules", "filesystem", "--policy", third],
+    `mayi: ${third} rule 3 has unknown action "alow". Valid actions: allow, deny, ask.\nmayi: ${NOTE_FORWARDED}\n`,
+  );
 });
 
 async function drive(rules, name, args, askResult = "denied") {

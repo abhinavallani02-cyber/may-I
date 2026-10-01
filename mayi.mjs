@@ -39,7 +39,15 @@ import { createInterface } from "node:readline";
 import { parse as parseYaml } from "yaml";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { compileStructural, evaluateStructural } from "./structural.mjs";
+import {
+  compileStructural,
+  evaluateStructural,
+  quoteValue,
+  ruleFailure,
+  NOTE_FORWARDED,
+  NOTE_TYPEERROR,
+  NOTE_EMPTY_TOOL,
+} from "./structural.mjs";
 
 const HELP_TEXT = `mayi -- an MCP proxy that enforces allow/deny/ask policy on tool calls
 
@@ -251,24 +259,42 @@ function globToRegex(glob) {
   return new RegExp(`^${escaped}$`);
 }
 let compiledRules = [];
-function compileRules(rules) {
-  if (!Array.isArray(rules)) {
+
+// One source file's rules, in that file's order. `number` is 1-based in
+// the file, not in the combined list. The combined position is assigned
+// later and is what a session grant keys on.
+function locateRules(rules, label) {
+  return rules.map((rule, index) => ({ rule, label, number: index + 1 }));
+}
+
+function compileRules(entries) {
+  if (!Array.isArray(entries)) {
     throw new Error('policy must have a top-level "rules" list');
   }
   // Build the whole list before publishing it, so a bad rule doesn't
   // leave a half-compiled policy in place for the next call.
-  const compiled = rules.map((rule, index) => {
-    const where = `policy rule ${index + 1}`;
+  const compiled = entries.map((entry, index) => {
+    const rule = entry.rule;
+    const place = `${entry.label} rule ${entry.number}`;
     if (!rule || typeof rule !== "object" || Array.isArray(rule)) {
-      throw new Error(`${where} must be a mapping`);
+      throw ruleFailure(place, `is ${quoteValue(rule)}, not a mapping.`, NOTE_TYPEERROR);
     }
-    if (typeof rule.tool !== "string" || rule.tool.length === 0) {
-      throw new Error(`${where} needs a string tool name`);
+    if (!Object.prototype.hasOwnProperty.call(rule, "tool") || typeof rule.tool === "undefined") {
+      throw ruleFailure(place, "is missing tool. tool must be a non-empty string.", NOTE_TYPEERROR);
+    }
+    if (typeof rule.tool !== "string") {
+      throw ruleFailure(place, `has tool ${quoteValue(rule.tool)}, not a string.`, NOTE_TYPEERROR);
+    }
+    if (rule.tool.length === 0) {
+      throw ruleFailure(place, 'has empty tool "".', NOTE_EMPTY_TOOL);
+    }
+    if (!Object.prototype.hasOwnProperty.call(rule, "action") || typeof rule.action === "undefined") {
+      throw ruleFailure(place, "is missing action. Valid actions: allow, deny, ask.", NOTE_FORWARDED);
     }
     if (rule.action !== "allow" && rule.action !== "deny" && rule.action !== "ask") {
-      throw new Error(`${where} action must be allow, deny, or ask`);
+      throw ruleFailure(place, `has unknown action ${quoteValue(rule.action)}. Valid actions: allow, deny, ask.`, NOTE_FORWARDED);
     }
-    const structural = compileStructural(rule, index);
+    const structural = compileStructural(rule, place);
     const compiledRule = { ...rule, regex: globToRegex(rule.tool), ...structural };
     // Non-enumerable so a hand-written `index:` field in the YAML stays
     // part of the rule content, and the position we assign here can't be
@@ -1195,11 +1221,11 @@ async function main() {
   // ./policy.yaml: that file is only the fallback when neither flag
   // is present. An unknown pack exits in loadPack before the server
   // is spawned.
-  const ruleLists = [];
+  const located = [];
   const sources = [];
   if (packName !== null) {
     const pack = loadPack(packName);
-    ruleLists.push(pack.policy.rules);
+    located.push(...locateRules(pack.policy.rules, `rules pack ${packName}`));
     sources.push(`rules pack ${packName} (${pack.path})`);
   }
   if (explicitPolicyPath) {
@@ -1207,21 +1233,24 @@ async function main() {
       console.error(`mayi: policy file not found: ${explicitPolicyPath}`);
       process.exit(1);
     }
-    ruleLists.push(loadPolicyFile(explicitPolicyPath).rules);
+    located.push(...locateRules(loadPolicyFile(explicitPolicyPath).rules, explicitPolicyPath));
     sources.push(explicitPolicyPath);
   } else if (packName === null && existsSync("policy.yaml")) {
-    ruleLists.push(loadPolicyFile("policy.yaml").rules);
+    located.push(...locateRules(loadPolicyFile("policy.yaml").rules, "policy.yaml"));
     sources.push("policy.yaml");
   } else if (packName === null) {
-    ruleLists.push(BUILTIN_DEFAULT_POLICY.rules);
+    located.push(...locateRules(BUILTIN_DEFAULT_POLICY.rules, "built-in default"));
     sources.push("built-in default (reads allowed, everything else asks)");
   }
-  policy = { rules: ruleLists.flat() };
+  policy = { rules: located.map((entry) => entry.rule) };
   const policySource = sources.join(", then ");
   try {
-    compileRules(policy.rules);
+    compileRules(located);
   } catch (err) {
-    console.error(`mayi: ${err.message}`);
+    const text = err && err.message ? String(err.message) : String(err);
+    for (const line of text.split("\n")) {
+      if (line.length > 0) console.error(`mayi: ${line}`);
+    }
     process.exit(1);
   }
 
@@ -1301,6 +1330,7 @@ async function main() {
 // this. askHuman is stubbed here so tests don't open /dev/tty.
 export function configureForTest({
   rules,
+  rulePlaces = null,
   auditFile,
   includeArgs = false,
   autoDeclineMs = 750,
@@ -1312,7 +1342,12 @@ export function configureForTest({
   resetGrants = true,
 }) {
   policy = { rules };
-  compileRules(rules);
+  const places = Array.isArray(rulePlaces) ? rulePlaces : [];
+  compileRules(rules.map((rule, index) => ({
+    rule,
+    label: places[index] ? places[index].label : "policy",
+    number: places[index] ? places[index].number : index + 1,
+  })));
   auditPath = auditFile;
   auditIncludeArgs = includeArgs;
   elicitAutoDeclineMs = autoDeclineMs;
