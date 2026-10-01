@@ -1,6 +1,6 @@
 {
   "name": "mayi-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "An MCP proxy that enforces allow/deny/ask policy on tool calls between an MCP client and server.",
   "main": "mayi.mjs",
   "bin": {
@@ -13,6 +13,7 @@
     "rules",
     "policy.yaml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

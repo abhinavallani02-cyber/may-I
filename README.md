@@ -94,6 +94,11 @@ mayi -- npx -y @modelcontextprotocol/server-filesystem /path/to/allow
 ```
 
 The package is published as `mayi-mcp`; the command it installs is `mayi`.
+`npm install mayi-mcp` installs `yaml` only. It does not install
+`@modelcontextprotocol/server-filesystem`; the examples above download
+that server with `npx -y`. It does not install `@modelcontextprotocol/sdk`
+or `zod`. Those are optional peers, used only with `--upstream-url`.
+See [Remote servers](#remote-servers).
 
 With no `--policy` flag and no `policy.yaml` in the current directory,
 may-i runs with a built-in conservative default: reads are allowed,
@@ -203,13 +208,19 @@ npm install @modelcontextprotocol/sdk
 ```
 
 Current SDK releases depend on `zod` and install it with that command.
-If yours does not, install `zod` too. If the SDK cannot be imported,
-may-i exits 1 before it reads or answers client traffic, prints no
-stack trace, and writes exactly this line to stderr:
+If yours does not, install `zod` too. If `@modelcontextprotocol/sdk`
+itself cannot be resolved, may-i exits 1 before it reads or answers
+client traffic, prints no stack trace, and writes exactly this line
+to stderr:
 
 ```
 HTTP transport requires @modelcontextprotocol/sdk. Install it with npm install @modelcontextprotocol/sdk.
 ```
+
+Any other failure while loading that transport also exits 1 before
+client traffic is read, with no stack trace. The stderr line is
+`mayi:` plus the error message. A missing `zod` takes that path, not
+the line above.
 
 may-i opens the upstream with `@modelcontextprotocol/sdk`'s
 `StreamableHTTPClientTransport` or `SSEClientTransport` before it
