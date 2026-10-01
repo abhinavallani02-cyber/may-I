@@ -32,8 +32,10 @@
   "type": "commonjs",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
-    "@modelcontextprotocol/server-filesystem": "^2026.7.10",
     "yaml": "^2.9.0",
     "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/server-filesystem": "^2026.7.10"
   }
 }
